@@ -1,0 +1,153 @@
+# ==========================================================
+# CELL 16A-CHECK — VERIFY ENTITY LINKING OUTPUT
+# ==========================================================
+# Run right after Cell 16A.
+# Hard failures  -> AssertionError (the output is wrong).
+# Soft warnings  -> printed, but do not stop the notebook.
+#
+# Depends on: linked_entities, seed_nodes, NODE_LABEL, g, QUERY,
+#             entity_phrases, and the Cell 13 config.
+# ==========================================================
+
+from rdflib import RDF, URIRef
+
+print("=" * 80)
+print("CELL 16A OUTPUT CHECK")
+print("=" * 80)
+
+REQUIRED_KEYS = {
+    "node", "label", "score", "phrase", "match_type", "class_hint",
+}
+
+# Valid score range per match type (mirrors the scoring in Cell 16A)
+SCORE_RANGES = {
+    "exact":     (100.0, 100.0),
+    "substring": (85.0, 95.0),
+    "fuzzy":     (float(MATCH_CUTOFF), 100.0),
+    "lexical":   (0.0, 85.0),
+}
+
+warnings: list[str] = []
+
+
+def check(condition: bool, message: str) -> None:
+    """Hard check: raise if the condition is false."""
+    assert condition, f"FAILED: {message}"
+
+
+def warn(condition: bool, message: str) -> None:
+    """Soft check: record a warning if the condition is true."""
+    if condition:
+        warnings.append(message)
+
+
+# ----------------------------------------------------------
+# 1. Candidate list (linked_entities)
+# ----------------------------------------------------------
+
+check(isinstance(linked_entities, list), "linked_entities must be a list.")
+check(linked_entities, "No candidates: nothing linked, not even by fallback.")
+check(len(linked_entities) <= N_CANDIDATES,
+      f"more than N_CANDIDATES ({N_CANDIDATES}) candidates.")
+
+for item in linked_entities:
+    check(REQUIRED_KEYS <= item.keys(),
+          f"candidate missing keys: {REQUIRED_KEYS - item.keys()}")
+
+    low, high = SCORE_RANGES[item["match_type"]]
+    check(low <= item["score"] <= high,
+          f"{item['label']!r}: {item['match_type']} score "
+          f"{item['score']:.2f} outside [{low}, {high}].")
+
+nodes = [item["node"] for item in linked_entities]
+scores = [item["score"] for item in linked_entities]
+
+check(len(nodes) == len(set(nodes)), "duplicate nodes in linked_entities.")
+check(scores == sorted(scores, reverse=True), "candidates not sorted by score.")
+check(all(PREDICATE_MARKER not in n for n in nodes),
+      "a predicate node became a candidate.")
+
+# ----------------------------------------------------------
+# 2. Seed nodes
+# ----------------------------------------------------------
+
+check(isinstance(seed_nodes, list), "seed_nodes must be a list.")
+check(seed_nodes, "No seed nodes selected.")
+check(len(seed_nodes) <= MAX_SEEDS, f"more than MAX_SEEDS ({MAX_SEEDS}) seeds.")
+check(len(seed_nodes) == len(set(seed_nodes)), "duplicate seed nodes.")
+check(set(seed_nodes) <= set(nodes), "a seed is not in linked_entities.")
+
+score_of = {item["node"]: item["score"] for item in linked_entities}
+floor = scores[0] * SEED_REL_CUTOFF
+
+for node in seed_nodes:
+    check(score_of[node] >= floor,
+          f"seed {NODE_LABEL.get(node, node)!r} scores below the "
+          f"relative cutoff ({floor:.2f}).")
+
+check(seed_nodes[0] == nodes[0], "best candidate is not the first seed.")
+
+# ----------------------------------------------------------
+# 3. Seeds exist in the graph and are usable for traversal
+# ----------------------------------------------------------
+
+stmt_subjects = set(g.objects(None, RDF.subject))
+stmt_objects = set(g.objects(None, RDF.object))
+
+for node in seed_nodes:
+    uri = URIRef(node)
+    check((uri, None, None) in g, f"seed not found in graph: {node}")
+    warn(uri not in stmt_subjects,
+         f"seed has NO outgoing edges (traversal will stop): "
+         f"{NODE_LABEL.get(node, node)}")
+
+# ----------------------------------------------------------
+# 4. Sanity warnings
+# ----------------------------------------------------------
+
+used_types = {item["match_type"] for item in linked_entities}
+
+warn(used_types == {"lexical"} and bool(entity_phrases),
+     "Phrases were extracted, but only the lexical fallback produced results.")
+warn(used_types == {"fuzzy"},
+     "All candidates are fuzzy matches; check MATCH_CUTOFF and the phrases.")
+warn(len(seed_nodes) < MAX_SEEDS and len(linked_entities) >= MAX_SEEDS,
+     f"Only {len(seed_nodes)} seeds selected out of {len(linked_entities)} "
+     f"candidates; SEED_REL_CUTOFF ({SEED_REL_CUTOFF}) may be too strict.")
+warn(all(item["match_type"] == "fuzzy" and item["score"] < 80
+         for item in linked_entities[:1]),
+     "Best candidate is a weak fuzzy match (<80); seeds may be unreliable.")
+
+covered = {item["phrase"] for item in linked_entities}
+for phrase, _ in entity_phrases:
+    warn(phrase.strip() not in covered and "lexical" not in used_types,
+         f"Phrase not linked to any KG node: {phrase!r}")
+
+# ----------------------------------------------------------
+# 5. Summary
+# ----------------------------------------------------------
+
+print(f"Query               : {QUERY}")
+print(f"Entity phrases      : {[p for p, _ in entity_phrases] or 'none (fallback)'}")
+print(f"Candidates          : {len(linked_entities)}")
+print(f"Match types         : {sorted(used_types)}")
+print(f"Seeds selected      : {len(seed_nodes)} / {MAX_SEEDS}")
+print(f"Seed score floor    : {floor:.2f}  "
+      f"(best {scores[0]:.2f} x {SEED_REL_CUTOFF})")
+
+print("\nSEEDS  (score | type | outgoing edges | label)")
+for node in seed_nodes:
+    item = next(i for i in linked_entities if i["node"] == node)
+    has_out = "yes" if URIRef(node) in stmt_subjects else "NO "
+    print(f"  {item['score']:6.2f} | {item['match_type']:<9} | "
+          f"{has_out:<3} | {item['label']}")
+
+print()
+if warnings:
+    print("WARNINGS")
+    for w in warnings:
+        print(f"  ⚠ {w}")
+else:
+    print("No warnings.")
+
+print("\n✅ Cell 16A output verified.")
