@@ -1,0 +1,889 @@
+# ==========================================================
+# CELL 16B — OUTGOING GRAPH TRAVERSAL
+# ==========================================================
+# Input:
+#   seed_nodes       -> Cell 16A
+#   linked_entities  -> Cell 16A
+#   g                -> RDF graph
+#
+# Flow:
+#
+#   Seed Nodes
+#       ↓
+#   Outgoing edges
+#       ↓
+#   Hop 1
+#       ↓
+#   Rank Hop-1 nodes
+#       ↓
+#   MAX_FRONTIER
+#       ↓
+#   Outgoing edges of NEW Hop-1 nodes
+#       ↓
+#   Hop 2
+#
+# IMPORTANT:
+#   - OUTGOING EDGES ONLY
+#   - No reverse/incoming traversal
+#   - Seeds are not expanded again at Hop 2
+#   - Only NEW Hop-1 nodes become Hop-2 frontier
+# ==========================================================
+
+from collections import defaultdict
+import pandas as pd
+
+print("=" * 80)
+print("CELL 16B — OUTGOING GRAPH TRAVERSAL")
+print("=" * 80)
+
+
+# ----------------------------------------------------------
+# 0. Guards
+# ----------------------------------------------------------
+
+REQUIRED = (
+    "g",
+    "seed_nodes",
+    "linked_entities",
+    "PREFIXES",
+    "MAX_HOPS",
+    "HOP_DECAY",
+    "MAX_FRONTIER",
+    "MAX_EDGES",
+    "MIN_EDGE_STRENGTH",
+)
+
+_missing = [x for x in REQUIRED if x not in globals()]
+
+if _missing:
+    raise RuntimeError(
+        f"Missing variables: {_missing}. "
+        f"Run Cell 13 and Cell 16A first."
+    )
+
+
+# ----------------------------------------------------------
+# 1. Node labels
+# ----------------------------------------------------------
+
+# Cell 16A already creates NODE_LABEL.
+# Keep a safe fallback in case the variable name differs.
+
+if "NODE_LABEL" in globals():
+    node_label = NODE_LABEL
+
+elif "label_index" in globals():
+    node_label = label_index.node_label
+
+else:
+    node_label = {}
+
+
+# ----------------------------------------------------------
+# 2. Convert seed_nodes into seed records
+# ----------------------------------------------------------
+#
+# Cell 16A:
+#
+# seed_nodes = [
+#     "http://knwbt.local/kg/entity/...",
+#     ...
+# ]
+#
+# linked_entities contains:
+#   node
+#   label
+#   score
+#   phrase
+#
+# We need the score because graph_score starts from
+# the entity-linking score.
+# ----------------------------------------------------------
+
+seed_lookup = {
+    item["node"]: item
+    for item in linked_entities
+}
+
+
+seeds = []
+
+for node in seed_nodes:
+
+    item = seed_lookup.get(node)
+
+    if item is None:
+        continue
+
+    seeds.append({
+        "node": node,
+        "label": item["label"],
+        "score": float(item["score"]),
+        "phrase": item["phrase"],
+    })
+
+
+# ----------------------------------------------------------
+# 3. Print seeds
+# ----------------------------------------------------------
+
+print("\nSEED NODES")
+print("-" * 80)
+
+if not seeds:
+
+    print("No seed nodes available.")
+
+else:
+
+    for i, seed in enumerate(seeds, start=1):
+
+        print(
+            f"{i}. {seed['label']} "
+            f"(score={seed['score']:.2f})"
+        )
+
+
+# ----------------------------------------------------------
+# 4. OUTGOING SPARQL QUERY
+# ----------------------------------------------------------
+#
+# We follow:
+#
+#     source → target
+#
+# We DO NOT search:
+#
+#     target → source
+#
+# This is outgoing-only traversal.
+#
+# The query follows the RDF reification structure from
+# the reference code:
+#
+# rdf:Statement
+# rdf:subject
+# rdf:predicate
+# rdf:object
+# ex:strength
+# ex:description
+# ex:linkType
+# ----------------------------------------------------------
+
+OUT_QUERY = PREFIXES + """
+
+SELECT ?target ?predicate ?strength ?description ?linkType
+
+WHERE {
+
+    ?statement a rdf:Statement ;
+
+               rdf:subject    ?source ;
+
+               rdf:predicate  ?predicate ;
+
+               rdf:object     ?target ;
+
+               ex:strength    ?strength ;
+
+               ex:description ?description ;
+
+               ex:linkType    ?linkType .
+
+    FILTER ( isIRI(?target) )
+}
+"""
+
+
+# ----------------------------------------------------------
+# 5. Get outgoing edges of ONE node
+# ----------------------------------------------------------
+
+def outgoing(node):
+    """
+    Return outgoing relationships:
+
+        node → target
+
+    Duplicate predicate + target combinations are merged,
+    keeping the strongest relationship.
+    """
+
+    best = {}
+
+    for row in g.query(
+        OUT_QUERY,
+        initBindings={"source": node}
+    ):
+
+        # ----------------------------------------------
+        # Convert edge strength safely
+        # ----------------------------------------------
+
+        try:
+            strength = int(row.strength)
+
+        except (TypeError, ValueError):
+            strength = 0
+
+
+        target = str(row.target)
+        predicate = str(row.predicate)
+
+
+        # ----------------------------------------------
+        # Duplicate relationship key
+        # ----------------------------------------------
+
+        key = (
+            predicate,
+            target
+        )
+
+
+        # ----------------------------------------------
+        # Keep strongest duplicate
+        # ----------------------------------------------
+
+        if (
+            key not in best
+            or
+            strength > best[key]["strength"]
+        ):
+
+            best[key] = {
+
+                "target": target,
+
+                "predicate": predicate,
+
+                "strength": strength,
+
+                "description":
+                    str(row.description),
+
+                "link_type":
+                    str(row.linkType),
+            }
+
+
+    return list(best.values())
+
+
+# ----------------------------------------------------------
+# 6. GRAPH TRAVERSAL
+# ----------------------------------------------------------
+
+def traverse_outgoing(seeds):
+
+    # ======================================================
+    # reached
+    #
+    # Stores every node reached during traversal.
+    #
+    # node → information
+    # ======================================================
+
+    reached = {}
+
+
+    # ======================================================
+    # all_edges
+    #
+    # Stores graph relationships discovered during
+    # traversal.
+    # ======================================================
+
+    all_edges = []
+
+
+    # ======================================================
+    # HOP 0 — ORIGINAL SEEDS
+    # ======================================================
+
+    for seed in seeds:
+
+        reached[seed["node"]] = {
+
+            "label":
+                seed["label"],
+
+            "hop":
+                0,
+
+            "root_seed":
+                seed["node"],
+
+            "seed_score":
+                seed["score"],
+
+            "path_strength":
+                1.0,
+
+            "graph_score":
+                seed["score"],
+
+            "parent":
+                None,
+
+            "predicate":
+                None,
+
+            "strength":
+                None,
+
+            "description":
+                None,
+
+            "link_type":
+                None,
+        }
+
+
+    # ======================================================
+    # Initial frontier
+    #
+    # At the beginning:
+    #
+    # frontier = Seed Nodes
+    # ======================================================
+
+    frontier = [
+        seed["node"]
+        for seed in seeds
+    ]
+
+
+    edge_cap_hit = False
+
+
+    # ======================================================
+    # HOP 1 / HOP 2
+    # ======================================================
+
+    for hop in range(
+        1,
+        MAX_HOPS + 1
+    ):
+
+        print()
+        print("=" * 80)
+        print(f"HOP {hop}")
+        print("=" * 80)
+
+        print(
+            f"Current frontier size : "
+            f"{len(frontier)}"
+        )
+
+
+        # --------------------------------------------------
+        # Nothing to expand
+        # --------------------------------------------------
+
+        if not frontier:
+
+            print("No nodes available for this hop.")
+
+            break
+
+
+        # --------------------------------------------------
+        # Nodes discovered ONLY during this hop
+        # --------------------------------------------------
+
+        new_nodes = {}
+
+
+        # ==================================================
+        # Expand current frontier
+        # ==================================================
+
+        for src in frontier:
+
+            source_label = node_label.get(
+                src,
+                str(src).rsplit("/", 1)[-1]
+            )
+
+            print(
+                f"\nExpanding: {source_label}"
+            )
+
+
+            # ----------------------------------------------
+            # IMPORTANT:
+            #
+            # outgoing(src)
+            #
+            # means:
+            #
+            # src → target
+            #
+            # ONLY outgoing.
+            # ----------------------------------------------
+
+            edges = outgoing(src)
+
+
+            print(
+                f"Outgoing edges found: "
+                f"{len(edges)}"
+            )
+
+
+            for e in edges:
+
+                # ------------------------------------------
+                # MAX_EDGES protection
+                # ------------------------------------------
+
+                if len(all_edges) >= MAX_EDGES:
+
+                    edge_cap_hit = True
+
+                    break
+
+
+                # ------------------------------------------
+                # Minimum edge strength
+                # ------------------------------------------
+
+                if (
+                    e["strength"]
+                    < MIN_EDGE_STRENGTH
+                ):
+
+                    continue
+
+
+                tgt = e["target"]
+
+
+                # ------------------------------------------
+                # Already reached?
+                #
+                # Prevent:
+                #   cycles
+                #   revisiting seeds
+                #   duplicate expansion
+                # ------------------------------------------
+
+                if tgt in reached:
+
+                    continue
+
+
+                # ------------------------------------------
+                # Parent information
+                # ------------------------------------------
+
+                parent = reached[src]
+
+
+                # ------------------------------------------
+                # Path strength
+                #
+                # Hop 1:
+                #
+                # parent path strength = 1
+                #
+                # edge strength = 8
+                #
+                # path strength = 1 × 8 / 10
+                #                = 0.8
+                #
+                # Hop 2 continues multiplying.
+                # ------------------------------------------
+
+                path_strength = (
+                    parent["path_strength"]
+                    *
+                    e["strength"]
+                    /
+                    10.0
+                )
+
+
+                # ------------------------------------------
+                # Hop decay
+                #
+                # Hop 1 = 1.0
+                #
+                # Hop 2 = HOP_DECAY
+                # ------------------------------------------
+
+                hop_decay = (
+                    1.0
+                    if hop == 1
+                    else HOP_DECAY ** (hop - 1)
+                )
+
+
+                # ------------------------------------------
+                # Graph score
+                # ------------------------------------------
+
+                graph_score = (
+                    parent["seed_score"]
+                    *
+                    path_strength
+                    *
+                    hop_decay
+                )
+
+
+                # ==================================================
+                # Store edge evidence
+                # ==================================================
+
+                all_edges.append({
+
+                    "hop":
+                        hop,
+
+                    "source":
+                        src,
+
+                    "target":
+                        tgt,
+
+                    "predicate":
+                        e["predicate"],
+
+                    "strength":
+                        e["strength"],
+
+                    "description":
+                        e["description"],
+
+                    "link_type":
+                        e["link_type"],
+
+                    "root_seed":
+                        parent["root_seed"],
+
+                    "hop_decay":
+                        hop_decay,
+
+                    "graph_score":
+                        graph_score,
+                })
+
+
+                # ==================================================
+                # Create target node information
+                # ==================================================
+
+                info = {
+
+                    "label":
+                        node_label.get(
+                            tgt,
+                            str(tgt).rsplit(
+                                "/",
+                                1
+                            )[-1]
+                        ),
+
+                    "hop":
+                        hop,
+
+                    "root_seed":
+                        parent["root_seed"],
+
+                    "seed_score":
+                        parent["seed_score"],
+
+                    "path_strength":
+                        path_strength,
+
+                    "graph_score":
+                        graph_score,
+
+                    "parent":
+                        src,
+
+                    "predicate":
+                        e["predicate"].rsplit(
+                            "/",
+                            1
+                        )[-1],
+
+                    "strength":
+                        e["strength"],
+
+                    "description":
+                        e["description"],
+
+                    "link_type":
+                        e["link_type"],
+                }
+
+
+                # ------------------------------------------
+                # Same target can be reached from multiple
+                # parents during the same hop.
+                #
+                # Keep the stronger path.
+                # ------------------------------------------
+
+                if (
+                    tgt not in new_nodes
+                    or
+                    graph_score
+                    >
+                    new_nodes[tgt]["graph_score"]
+                ):
+
+                    new_nodes[tgt] = info
+
+
+            # ------------------------------------------------
+            # Stop if MAX_EDGES reached
+            # ------------------------------------------------
+
+            if edge_cap_hit:
+
+                break
+
+
+        # ==================================================
+        # Add newly discovered nodes
+        # ==================================================
+
+        reached.update(
+            new_nodes
+        )
+
+
+        # ==================================================
+        # RANK NEW NODES
+        #
+        # This ranking determines which nodes become the
+        # next frontier.
+        # ==================================================
+
+        ranked_new_nodes = sorted(
+            new_nodes.items(),
+            key=lambda item:
+                -item[1]["graph_score"]
+        )
+
+
+        # ==================================================
+        # NEXT FRONTIER
+        #
+        # IMPORTANT:
+        #
+        # Only NEW nodes from this hop are carried forward.
+        #
+        # Seeds are NOT put back into the frontier.
+        # ==================================================
+
+        frontier = [
+            node
+            for node, _info
+            in ranked_new_nodes[
+                :MAX_FRONTIER
+            ]
+        ]
+
+
+        # ==================================================
+        # Print ranked nodes
+        # ==================================================
+
+        print()
+        print(
+            f"NEW NODES — HOP {hop}"
+        )
+        print("-" * 80)
+
+        if not ranked_new_nodes:
+
+            print("No new nodes discovered.")
+
+        else:
+
+            for rank, (node, info) in enumerate(
+                ranked_new_nodes,
+                start=1
+            ):
+
+                print(
+                    f"{rank:>3}. "
+                    f"{info['label']:<45} "
+                    f"score={info['graph_score']:.4f}"
+                )
+
+
+        # ==================================================
+        # Hop summary
+        # ==================================================
+
+        print()
+        print(
+            f"New nodes discovered : "
+            f"{len(new_nodes)}"
+        )
+
+        print(
+            f"Next frontier size   : "
+            f"{len(frontier)}"
+        )
+
+        print(
+            f"Edges so far        : "
+            f"{len(all_edges)}"
+        )
+
+
+        # --------------------------------------------------
+        # MAX_EDGES reached
+        # --------------------------------------------------
+
+        if edge_cap_hit:
+
+            print(
+                f"MAX_EDGES reached: "
+                f"{MAX_EDGES}"
+            )
+
+            break
+
+
+    return reached, all_edges
+
+
+# ----------------------------------------------------------
+# 7. RUN
+# ----------------------------------------------------------
+
+if not seeds:
+
+    print()
+    print(
+        "No seed nodes available. "
+        "Traversal skipped."
+    )
+
+    reached_nodes = {}
+    all_edges = []
+
+else:
+
+    reached_nodes, all_edges = traverse_outgoing(
+        seeds
+    )
+
+
+# ----------------------------------------------------------
+# 8. RESULT SUMMARY
+# ----------------------------------------------------------
+
+hop_counts = defaultdict(int)
+
+for info in reached_nodes.values():
+
+    hop_counts[
+        info["hop"]
+    ] += 1
+
+
+print()
+print("=" * 80)
+print("CELL 16B — TRAVERSAL RESULT")
+print("=" * 80)
+
+print(
+    f"Seed nodes : "
+    f"{hop_counts[0]}"
+)
+
+print(
+    f"Hop 1 nodes: "
+    f"{hop_counts[1]}"
+)
+
+print(
+    f"Hop 2 nodes: "
+    f"{hop_counts[2]}"
+)
+
+print(
+    f"Edges      : "
+    f"{len(all_edges)}"
+)
+
+
+# ----------------------------------------------------------
+# 9. EDGE TABLE
+# ----------------------------------------------------------
+
+if all_edges:
+
+    edges_df = pd.DataFrame([
+
+        {
+            "hop":
+                e["hop"],
+
+            "source":
+                node_label.get(
+                    e["source"],
+                    str(e["source"])
+                ),
+
+            "predicate":
+                e["predicate"].rsplit(
+                    "/",
+                    1
+                )[-1],
+
+            "target":
+                node_label.get(
+                    e["target"],
+                    str(e["target"])
+                ),
+
+            "strength":
+                e["strength"],
+
+            "graph_score":
+                round(
+                    e["graph_score"],
+                    4
+                ),
+
+            "root_seed":
+                node_label.get(
+                    e["root_seed"],
+                    str(e["root_seed"])
+                ),
+        }
+
+        for e in all_edges
+
+    ])
+
+    print()
+    print("=" * 80)
+    print("GRAPH EVIDENCE / EDGES")
+    print("=" * 80)
+
+    display(edges_df)
+
+else:
+
+    print("\nNo graph edges discovered.")
+
+
+# ----------------------------------------------------------
+# 10. COMPLETION
+# ----------------------------------------------------------
+
+print()
+print("=" * 80)
+print("CELL 16B COMPLETED")
+print("=" * 80)
