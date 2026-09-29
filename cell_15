@@ -1,0 +1,103 @@
+# ==========================================================
+# CELL 15 — QUERY → ENTITY PHRASES
+# ==========================================================
+
+import re
+
+print("=" * 80)
+print("CELL 15 — QUERY ENTITY EXTRACTION")
+print("=" * 80)
+
+ALLOWED_CLASSES = [
+    "System", "Component", "ControlFactor", "NoiseFactor", "ErrorState",
+    "Method", "Procedure", "Standard", "Concept",
+]
+DEFAULT_CLASS = "Concept"
+
+EXTRACT_PROMPT = f"""
+You extract entity mentions from a question so they can be
+looked up in a systems-engineering knowledge graph.
+
+Return every noun phrase in the question that names a concrete thing:
+a system, component, parameter, method, standard, procedure,
+document, product, or failure mode.
+
+Use the exact phrase as it appears in the question.
+
+Do NOT return:
+- question words
+- verbs
+- generic words
+- words such as "process" or "information"
+- anything that is not explicitly present in the question
+
+Output one record per entity in exactly this format:
+
+<entity phrase>|<one of: {", ".join(ALLOWED_CLASSES)}>
+
+No explanation.
+No numbering.
+No markdown.
+
+If no concrete entity is found, return exactly:
+
+NONE
+"""
+
+# Bullets ("-", "*") or numbering ("1.", "2)") followed by a space.
+# Does not touch entities like "5G antenna" or "3D printer".
+LIST_MARKER = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+CLASS_LOOKUP = {c.lower(): c for c in ALLOWED_CLASSES}
+
+
+def extract_query_entities(question: str):
+    """
+    Convert the user's question into KG lookup phrases.
+
+    Returns:
+        [
+            (entity_phrase, class_hint),
+            ...
+        ]
+    """
+
+    try:
+        response = driver_llm.invoke([
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": question},
+        ])
+        text = response.content.strip()
+
+    except Exception as e:
+        print(f"Entity extraction failed: {e}")
+        print("Falling back to lexical matching in Cell 16.")
+        return []
+
+    # No entity found
+    if text.upper() == "NONE":
+        return []
+
+    question_lower = " ".join(question.lower().split())
+    seen = set()
+    entities = []
+
+    for line in text.splitlines():
+        line = LIST_MARKER.sub("", line).strip()
+
+        if "|" not in line:
+            continue
+
+        phrase, class_hint = line.split("|", 1)
+        phrase = phrase.strip()
+        key = " ".join(phrase.lower().split())
+
+        # Skip empty, duplicate, or hallucinated phrases
+        if not key or key in seen or key not in question_lower:
+            continue
+
+        class_hint = CLASS_LOOKUP.get(class_hint.strip(" .`*").lower(), DEFAULT_CLASS)
+
+        seen.add(key)
+        entities.append((phrase, class_hint))
+
+    return entities
