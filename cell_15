@@ -101,3 +101,25 @@ def extract_query_entities(question: str):
         entities.append((phrase, class_hint))
 
     return entities
+
+
+
+
+checking--->
+
+# ==========================================================
+# RUN CELL 15
+# ==========================================================
+
+entity_phrases = extract_query_entities(query)
+
+print("\nEXTRACTED ENTITY PHRASES")
+print("-" * 80)
+
+if not entity_phrases:
+    print("No entity phrases found.")
+else:
+    for phrase, class_hint in entity_phrases:
+        print(f"Phrase     : {phrase}")
+        print(f"Class Hint : {class_hint}")
+        print()
