@@ -1,0 +1,285 @@
+# ==========================================================
+# CELL 16A — ENTITY LINKING
+# ==========================================================
+# Input : entity_phrases (Cell 15), g (RDF graph), Cell 13 config + QUERY
+# Output: linked_entities, seed_nodes
+#
+# Phrase -> [exact | substring | fuzzy] label match
+#        -> merge by node (best score wins) -> rank -> seed nodes
+#
+# No graph traversal happens here.
+# ==========================================================
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+
+try:
+    from rapidfuzz import fuzz, process
+    FUZZY_BACKEND = "RapidFuzz"
+except ImportError:
+    import difflib
+    FUZZY_BACKEND = "difflib"
+
+print("=" * 80)
+print("CELL 16A — ENTITY LINKING")
+print("=" * 80)
+
+REQUIRED_CONFIG = (
+    "QUERY", "PREFIXES", "PREDICATE_MARKER", "MATCH_CUTOFF",
+    "FUZZY_CANDIDATES", "MAX_CANDIDATES_PER_PHRASE",
+    "N_CANDIDATES", "MAX_SEEDS", "SEED_REL_CUTOFF",
+)
+_missing = [name for name in REQUIRED_CONFIG if name not in globals()]
+if _missing:
+    raise RuntimeError(f"Missing Cell 13 configuration: {_missing}. Run Cell 13 first.")
+
+
+# ----------------------------------------------------------
+# 1. Configuration
+# ----------------------------------------------------------
+
+# Shared settings come from Cell 13: MATCH_CUTOFF, FUZZY_CANDIDATES,
+# MAX_CANDIDATES_PER_PHRASE, N_CANDIDATES, MAX_SEEDS, SEED_REL_CUTOFF,
+# PREFIXES, PREDICATE_MARKER.
+
+EXACT_SCORE = 100.0           # label == phrase
+SUBSTRING_BASE = 85.0         # phrase inside label: 85..95, scaled by coverage
+SUBSTRING_BONUS = 10.0
+LEXICAL_SCORE = 85.0          # fallback: max score, scaled by token overlap
+LEXICAL_MIN_OVERLAP = 0.5     # fallback: share of label tokens found in question
+
+TOKEN_RE = re.compile(r"[a-z0-9]+")
+STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
+    "in", "is", "it", "meant", "of", "on", "or", "the", "to", "what",
+    "when", "where", "which", "who", "why", "with",
+})
+
+DEFAULT_CLASS_HINT = "Concept"
+
+LABEL_QUERY = PREFIXES + """
+SELECT DISTINCT ?node ?label
+WHERE { ?node rdfs:label ?label . }
+ORDER BY ?node ?label
+"""
+
+
+# ----------------------------------------------------------
+# 2. Label index
+# ----------------------------------------------------------
+
+@dataclass(frozen=True)
+class LabelIndex:
+    """Lookup tables built once from the KG's rdfs:label triples."""
+    node_label: dict[str, str]             # node URI -> display label
+    label_to_nodes: dict[str, list[str]]   # lowercase label -> node URIs
+    labels: list[str]                      # distinct lowercase labels
+
+
+def build_label_index(graph) -> LabelIndex:
+    """Index entity labels from the graph (predicate nodes are excluded)."""
+    node_label: dict[str, str] = {}
+    label_to_nodes: dict[str, list[str]] = defaultdict(list)
+
+    for row in graph.query(LABEL_QUERY):
+        node, label = str(row.node), str(row.label).strip()
+
+        if not label or PREDICATE_MARKER in node:
+            continue
+
+        label_key = " ".join(label.lower().split())
+        node_label.setdefault(node, label)
+        if node not in label_to_nodes[label_key]:
+            label_to_nodes[label_key].append(node)
+
+    return LabelIndex(node_label, dict(label_to_nodes), list(label_to_nodes))
+
+
+# ----------------------------------------------------------
+# 3. Fuzzy matching
+# ----------------------------------------------------------
+
+def fuzzy_match(
+    query: str, choices: list[str], limit: int, cutoff: float
+) -> list[tuple[str, float]]:
+    """Return up to `limit` (choice, score 0-100) pairs above `cutoff`."""
+    if FUZZY_BACKEND == "RapidFuzz":
+        hits = process.extract(
+            query, choices,
+            scorer=fuzz.WRatio, limit=limit, score_cutoff=cutoff,
+        )
+        return [(match, score) for match, score, _ in hits]
+
+    matches = difflib.get_close_matches(
+        query, choices, n=limit, cutoff=cutoff / 100.0
+    )
+    return [
+        (m, difflib.SequenceMatcher(None, query, m).ratio() * 100)
+        for m in matches
+    ]
+
+
+# ----------------------------------------------------------
+# 4. Entity linking
+# ----------------------------------------------------------
+
+def _tokens(text: str) -> set[str]:
+    """Lowercase alphanumeric tokens without stopwords."""
+    return set(TOKEN_RE.findall((text or "").lower())) - STOPWORDS
+
+
+def _expand_to_nodes(
+    label_scores: dict[str, tuple[float, str]], phrase: str, index: LabelIndex
+) -> list[dict]:
+    """Turn {label: (score, match_type)} into node hits, best first."""
+    hits = [
+        {
+            "node": node,
+            "label": index.node_label[node],
+            "score": score,
+            "phrase": phrase,
+            "match_type": match_type,
+        }
+        for label, (score, match_type) in label_scores.items()
+        for node in index.label_to_nodes[label]
+    ]
+    return sorted(hits, key=lambda h: (-h["score"], h["label"], h["node"]))
+
+
+def _match_phrase(phrase: str, index: LabelIndex) -> list[dict]:
+    """Exact / substring / fuzzy candidates for one phrase."""
+    key = " ".join(phrase.lower().split())
+    label_scores: dict[str, tuple[float, str]] = {}
+
+    for label in index.labels:
+        if label == key:
+            label_scores[label] = (EXACT_SCORE, "exact")
+        elif key in label:
+            coverage = len(key) / len(label)
+            label_scores[label] = (
+                SUBSTRING_BASE + SUBSTRING_BONUS * coverage, "substring"
+            )
+
+    # Fuzzy matches never overwrite a stronger match on the same label
+    for label, score in fuzzy_match(key, index.labels, FUZZY_CANDIDATES, MATCH_CUTOFF):
+        if label not in label_scores or score > label_scores[label][0]:
+            label_scores[label] = (float(score), "fuzzy")
+
+    return _expand_to_nodes(label_scores, phrase, index)[:MAX_CANDIDATES_PER_PHRASE]
+
+
+def _match_lexical(question: str, index: LabelIndex) -> list[dict]:
+    """Token-overlap fallback: score labels by the share of their tokens in the question."""
+    question_tokens = _tokens(question)
+    label_scores: dict[str, tuple[float, str]] = {}
+
+    for label in index.labels:
+        label_tokens = _tokens(label)
+        if not label_tokens:
+            continue
+
+        overlap = len(label_tokens & question_tokens) / len(label_tokens)
+        if overlap >= LEXICAL_MIN_OVERLAP:
+            label_scores[label] = (LEXICAL_SCORE * overlap, "lexical")
+
+    return _expand_to_nodes(label_scores, question, index)[:N_CANDIDATES]
+
+
+def _merge_best(best: dict[str, dict], hits: list[dict], class_hint: str) -> None:
+    """Merge hits into `best`, keeping the highest score per node."""
+    for hit in hits:
+        current = best.get(hit["node"])
+        if current is None or hit["score"] > current["score"]:
+            best[hit["node"]] = {**hit, "class_hint": class_hint}
+
+
+def link_entities(
+    phrases: list[tuple[str, str]],
+    index: LabelIndex,
+    question: str = "",
+) -> list[dict]:
+    """
+    Link (phrase, class_hint) pairs to KG nodes.
+
+    If nothing links (no phrases from Cell 15, or none matched the KG),
+    fall back to token-overlap matching against the raw question.
+
+    Returns up to N_CANDIDATES candidates, one per node (best score wins),
+    sorted by score.
+    """
+    best: dict[str, dict] = {}
+
+    for phrase, class_hint in phrases:
+        phrase = phrase.strip()
+        if phrase:
+            _merge_best(best, _match_phrase(phrase, index), class_hint)
+
+    if not best and question.strip():
+        print("No KG nodes linked from phrases; falling back to lexical matching.")
+        _merge_best(best, _match_lexical(question, index), DEFAULT_CLASS_HINT)
+
+    ranked = sorted(best.values(), key=lambda h: (-h["score"], h["label"]))
+    return ranked[:N_CANDIDATES]
+
+
+def select_seeds(linked: list[dict]) -> list[str]:
+    """Pick up to MAX_SEEDS start nodes scoring >= SEED_REL_CUTOFF of the best."""
+    if not linked:
+        return []
+    floor = linked[0]["score"] * SEED_REL_CUTOFF
+    return [h["node"] for h in linked if h["score"] >= floor][:MAX_SEEDS]
+
+
+# ----------------------------------------------------------
+# 5. Run
+# ----------------------------------------------------------
+
+label_index = build_label_index(g)
+NODE_LABEL = label_index.node_label   # kept for downstream cells
+
+print(f"Fuzzy matcher           : {FUZZY_BACKEND}")
+print(f"KG entity nodes indexed : {len(label_index.node_label)}")
+print(f"Distinct KG labels      : {len(label_index.labels)}")
+
+linked_entities = link_entities(
+    entity_phrases,
+    label_index,
+    question=QUERY,
+)
+seed_nodes = select_seeds(linked_entities)
+
+
+# ----------------------------------------------------------
+# 6. Display
+# ----------------------------------------------------------
+
+print("\n" + "=" * 80)
+print("ENTITY LINKING RESULTS")
+print("=" * 80)
+
+if not linked_entities:
+    print("No KG nodes matched the extracted entity phrases.")
+
+for i, item in enumerate(linked_entities, start=1):
+    print(f"\nCandidate {i}")
+    print("-" * 50)
+    print(f"Phrase      : {item['phrase']}")
+    print(f"Class Hint  : {item['class_hint']}")
+    print(f"KG Label    : {item['label']}")
+    print(f"Score       : {item['score']:.2f}")
+    print(f"Match Type  : {item['match_type']}")
+    print(f"Node URI    : {item['node']}")
+
+print("\n" + "=" * 80)
+print("SEED NODES")
+print("=" * 80)
+
+if not seed_nodes:
+    print("No seed nodes found.")
+
+for i, node in enumerate(seed_nodes, start=1):
+    print(f"{i}. {NODE_LABEL[node]}")
+    print(f"   URI   : {node}")
