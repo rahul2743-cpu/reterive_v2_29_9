@@ -1,0 +1,201 @@
+# ==========================================================
+# CELL 16B — PYVIS GRAPH VISUALIZATION
+# ==========================================================
+from pyvis.network import Network
+from IPython.display import display, HTML
+import os
+
+print("=" * 80)
+print("CELL 16B — PYVIS OUTGOING TRAVERSAL VISUALIZATION")
+print("=" * 80)
+
+if not all_edges:
+    print("No traversal edges available for visualization.")
+else:
+
+    # ------------------------------------------------------
+    # 1. Create PyVis network
+    # ------------------------------------------------------
+    net = Network(
+        height="750px",
+        width="100%",
+        directed=True,
+        notebook=True,
+        cdn_resources="in_line"
+    )
+
+    # ------------------------------------------------------
+    # 2. Improve physics / layout
+    # ------------------------------------------------------
+    net.set_options("""
+    {
+      "physics": {
+        "enabled": true,
+        "solver": "forceAtlas2Based",
+        "forceAtlas2Based": {
+          "gravitationalConstant": -300,
+          "centralGravity": 0.01,
+          "springLength": 180,
+          "springConstant": 0.05,
+          "damping": 0.4,
+          "avoidOverlap": 1
+        },
+        "stabilization": {
+          "enabled": true,
+          "iterations": 300
+        }
+      },
+      "interaction": {
+        "hover": true,
+        "navigationButtons": true,
+        "keyboard": true,
+        "multiselect": true
+      },
+      "edges": {
+        "arrows": {
+          "to": {
+            "enabled": true,
+            "scaleFactor": 0.7
+          }
+        },
+        "smooth": {
+          "enabled": true,
+          "type": "curvedCW"
+        }
+      }
+    }
+    """)
+
+    # ------------------------------------------------------
+    # 3. Add seed nodes
+    # ------------------------------------------------------
+    for seed in seeds:
+
+        node_id = seed["node"]
+        label = seed["label"]
+
+        title = (
+            f"<b>SEED NODE</b><br>"
+            f"Label: {label}<br>"
+            f"Score: {seed['score']:.2f}<br>"
+            f"Phrase: {seed.get('phrase', '')}<br>"
+            f"Hop: 0"
+        )
+
+        net.add_node(
+            node_id,
+            label=label,
+            title=title,
+            color="#ff9800",
+            size=30,
+            shape="dot"
+        )
+
+    # ------------------------------------------------------
+    # 4. Add traversal edges + nodes
+    # ------------------------------------------------------
+    for e in all_edges:
+
+        source = e["source"]
+        target = e["target"]
+
+        source_label = node_label.get(
+            source,
+            str(source).rsplit("/", 1)[-1]
+        )
+
+        target_label = node_label.get(
+            target,
+            str(target).rsplit("/", 1)[-1]
+        )
+
+        hop = e["hop"]
+        strength = e["strength"]
+        graph_score = e["graph_score"]
+        predicate = e["predicate"].rsplit("/", 1)[-1]
+
+        # --------------------------------------------------
+        # Node color based on hop
+        # --------------------------------------------------
+        if hop == 1:
+            node_color = "#2196F3"
+            node_size = 24
+        else:
+            node_color = "#4CAF50"
+            node_size = 20
+
+        # --------------------------------------------------
+        # Add source if not already present
+        # --------------------------------------------------
+        if source not in net.node_ids:
+
+            net.add_node(
+                source,
+                label=source_label,
+                title=f"""
+                <b>Source Node</b><br>
+                {source_label}<br>
+                Hop: {hop - 1}
+                """,
+                color="#ff9800" if hop == 1 else "#2196F3",
+                size=30 if hop == 1 else 24,
+                shape="dot"
+            )
+
+        # --------------------------------------------------
+        # Add target node
+        # --------------------------------------------------
+        if target not in net.node_ids:
+
+            net.add_node(
+                target,
+                label=target_label,
+                title=f"""
+                <b>Target Node</b><br>
+                {target_label}<br>
+                Hop: {hop}<br>
+                Graph Score: {graph_score:.4f}
+                """,
+                color=node_color,
+                size=node_size,
+                shape="dot"
+            )
+
+        # --------------------------------------------------
+        # Add directed edge
+        # --------------------------------------------------
+        edge_title = (
+            f"<b>Relationship</b><br>"
+            f"Predicate: {predicate}<br>"
+            f"Strength: {strength}<br>"
+            f"Graph Score: {graph_score:.4f}<br>"
+            f"Hop: {hop}"
+        )
+
+        net.add_edge(
+            source,
+            target,
+            title=edge_title,
+            label=predicate,
+            width=max(1, min(5, strength)),
+            arrows="to"
+        )
+
+    # ------------------------------------------------------
+    # 5. Save HTML
+    # ------------------------------------------------------
+    output_file = "kg_outgoing_traversal.html"
+
+    net.write_html(
+        output_file,
+        notebook=True
+    )
+
+    print(f"Visualization saved to: {output_file}")
+    print(f"Nodes: {len(net.nodes)}")
+    print(f"Edges: {len(net.edges)}")
+
+    # ------------------------------------------------------
+    # 6. Display inside notebook
+    # ------------------------------------------------------
+    display(HTML(output_file))
