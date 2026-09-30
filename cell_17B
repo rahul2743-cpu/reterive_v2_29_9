@@ -1,0 +1,132 @@
+# ==========================================================
+# CELL 17B — DOCUMENT → CHUNKS
+# ==========================================================
+# Input  : ranked_document_content, ranked_documents (Cell 17A)
+#          hyperlink_title_dict (Cell 8a, optional)
+# Output : document_chunks
+#
+# NO BM25 / embeddings / ranking / MMR / LLM here.
+# ==========================================================
+
+import re
+from collections import Counter
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+for n in ("ranked_document_content", "ranked_documents"):
+    if n not in globals():
+        raise RuntimeError(f"Missing '{n}'. Run Cell 17A first.")
+
+# ----------------------------------------------------------
+# 1. CONFIGURATION
+#    Separate names, so Cell 13's CHUNK_SIZE (900) is not overwritten.
+# ----------------------------------------------------------
+
+CHUNK_SIZE_17B    = 200
+CHUNK_OVERLAP_17B = 30
+MIN_CHUNK_17B     = 40      # drop tiny leftovers such as "Short end."  (0 = keep everything)
+
+print("=" * 80)
+print("CELL 17B — DOCUMENT → CHUNKS")
+print("=" * 80)
+print(f"Chunk size {CHUNK_SIZE_17B} | overlap {CHUNK_OVERLAP_17B} | min chunk {MIN_CHUNK_17B}")
+
+# ----------------------------------------------------------
+# 2. CLEAN LINK MARKERS BEFORE SPLITTING
+#    "[label <doc:Temp_Import.<GUID>.WebHome>]" -> linked page title (or label).
+#    One raw marker is ~62 characters: a third of a 200-character chunk.
+# ----------------------------------------------------------
+
+_LINK   = re.compile(r"\[(?:(?P<label>[^<>\[\]]+?)\s+)?<doc:(?:wiki:)?(?P<ref>[^>]+)>\]")
+_STRAY  = re.compile(r"<doc:(?:wiki:)?[^>]*>")
+_titles = globals().get("hyperlink_title_dict", {})
+
+
+def clean(text):
+
+    def repl(m):
+        ref = re.sub(r"\s+", "", re.sub(r"^xwiki:", "", m.group("ref").strip()))
+        return _titles.get(ref) or (m.group("label") or "").strip()
+
+    text = _STRAY.sub("", _LINK.sub(repl, text or ""))
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# ----------------------------------------------------------
+# 3. SPLITTER
+#    keep_separator="end": the ". " stays at the END of a sentence.
+#    (Default puts it at the START of the next chunk: ". See ...")
+# ----------------------------------------------------------
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE_17B,
+    chunk_overlap=CHUNK_OVERLAP_17B,
+    separators=["\n\n", "\n", ". ", " ", ""],
+    keep_separator="end",
+    add_start_index=True,
+)
+
+# ----------------------------------------------------------
+# 4. SPLIT EACH DOCUMENT
+# ----------------------------------------------------------
+
+doc_info = {d["doc_id"]: d for d in ranked_documents}
+document_chunks = []
+
+for doc in ranked_document_content:
+
+    pieces = [
+        p for p in text_splitter.create_documents([clean(doc.get("content"))])
+        if len(p.page_content.strip()) >= MIN_CHUNK_17B
+    ]
+
+    ev = doc_info.get(doc["doc_id"], {})
+
+    for i, p in enumerate(pieces):
+        document_chunks.append({
+            "chunk_uid":      f'{doc["node_id"]}#{i}',  # node_id is unique, so this is unique
+            "chunk_id":       i,                        # position inside its document
+            "n_chunks":       len(pieces),
+            "rank":           doc["rank"],
+            "doc_id":         doc["doc_id"],
+            "source":         doc["source"],
+            "node_id":        doc["node_id"],
+            "node_name":      doc["node_name"],
+            "document_score": ev.get("document_score"),
+            "best_hop":       ev.get("best_hop"),
+            "start_index":    p.metadata.get("start_index"),
+            "content":        p.page_content,
+        })
+
+# ----------------------------------------------------------
+# 5. SUMMARY
+# ----------------------------------------------------------
+
+chunk_count = Counter(c["doc_id"] for c in document_chunks)
+sizes = [len(c["content"]) for c in document_chunks]
+
+print()
+print(f"Documents received : {len(ranked_document_content)}")
+print(f"Total chunks       : {len(document_chunks)}")
+if sizes:
+    print(f"Chunk length       : min {min(sizes)} | avg {sum(sizes)//len(sizes)} | max {max(sizes)}")
+print()
+for doc in ranked_document_content:
+    print(f"Rank {doc['rank']:>2} | doc_id {doc['doc_id']} | {doc['node_name']} | "
+          f"{chunk_count.get(doc['doc_id'], 0)} chunks")
+
+assert document_chunks, "No chunks created. Check document content and MIN_CHUNK_17B."
+
+print()
+print("SAMPLE CHUNKS (first 3)")
+for c in document_chunks[:3]:
+    print("-" * 80)
+    print(f"{c['node_name']} | chunk {c['chunk_id'] + 1}/{c['n_chunks']} | {len(c['content'])} chars")
+    print(c["content"])
+
+print()
+print("CELL 17B COMPLETED — ready for Cell 18.")
