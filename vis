@@ -1,0 +1,114 @@
+# ==========================================================
+# Cell 16b : VISUALIZE THE TRAVERSAL (pyvis)
+#            Draws exactly what traverse() returned:
+#              nodes  = visited      (colour + row by hop)
+#              edges  = edges list   (arrow = source -> target)
+#            Run: !pip install pyvis   (once)
+# ==========================================================
+import json
+from pyvis.network import Network
+from IPython.display import IFrame, display
+
+HOP_STYLE = {                       # hop -> (colour, size, legend text)
+    0: ("#7F77DD", 32, "Seed (hop 0)"),
+    1: ("#1D9E75", 24, "Hop 1"),
+    2: ("#888780", 18, "Hop 2"),
+}
+
+
+def _short(text, n=32):
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def visualize_traversal(edges, visited, filename="kg_traversal.html",
+                        hierarchical=True, height="650px"):
+    """
+    edges   : list of dicts returned by traverse()
+    visited : dict node -> (hop, seed_score) returned by traverse()
+    hierarchical=True  -> seed on top, hop 1 below, hop 2 at the bottom
+    hierarchical=False -> free-floating physics layout
+    """
+    if not visited and not edges:
+        print("Nothing to draw: traverse() returned no nodes or edges.")
+        return None
+
+    net = Network(height=height, width="100%", directed=True,
+                  bgcolor="#ffffff", font_color="#222222",
+                  cdn_resources="in_line")
+
+    # ---- nodes: every visited node, plus any edge endpoint just in case
+    labels = {}
+    for e in edges:
+        labels[e["source"]] = e["source_label"]
+        labels[e["target"]] = e["target_label"]
+
+    all_nodes = set(visited) | set(labels)
+    for node in all_nodes:
+        hop = visited.get(node, (2, 0))[0]
+        colour, size, legend = HOP_STYLE.get(hop, HOP_STYLE[2])
+        label = labels.get(node) or NODE_LABEL.get(node, node)
+        net.add_node(
+            node,
+            label=_short(label),
+            title=f"{label}\n{legend}\n{node}",
+            color=colour,
+            size=size,
+            level=hop,                       # used by the hierarchical layout
+            shape="star" if hop == 0 else "dot",
+            font={"size": 14},
+        )
+
+    # ---- edges: one arrow per traversed statement
+    max_strength = max((e["strength"] for e in edges), default=1) or 1
+    for e in edges:
+        colour = HOP_STYLE.get(e["hop"], HOP_STYLE[2])[0]
+        net.add_edge(
+            e["source"], e["target"],
+            label=_short(e["predicate"], 22),
+            title=(f"{e['source_label']}  --[{e['predicate']}]-->  {e['target_label']}\n"
+                   f"hop: {e['hop']}   strength: {e['strength']}   type: {e['link_type']}\n\n"
+                   f"{e['description']}"),
+            width=1 + 3 * e["strength"] / max_strength,   # thicker = stronger link
+            color=colour,
+            arrows="to",
+            dashes=(e["hop"] >= 2),          # hop 2 links are dashed
+            font={"size": 10, "align": "middle"},
+        )
+
+    # ---- layout options
+    if hierarchical:
+        options = {
+            "layout": {"hierarchical": {
+                "enabled": True, "direction": "UD", "sortMethod": "directed",
+                "levelSeparation": 150, "nodeSpacing": 170}},
+            "physics": {"enabled": False},
+            "edges": {"smooth": {"type": "cubicBezier"}},
+            "interaction": {"hover": True, "tooltipDelay": 100},
+        }
+    else:
+        options = {
+            "physics": {"barnesHut": {"gravitationalConstant": -8000,
+                                      "springLength": 160}},
+            "interaction": {"hover": True, "tooltipDelay": 100},
+        }
+    net.set_options(json.dumps(options))
+
+    net.write_html(filename)
+
+    # ---- text summary + legend
+    hop_counts = {}
+    for n in all_nodes:
+        h = visited.get(n, (2, 0))[0]
+        hop_counts[h] = hop_counts.get(h, 0) + 1
+    print(f"Saved: {filename}")
+    print(f"Nodes: {len(all_nodes)}   Edges: {len(edges)}")
+    for h in sorted(hop_counts):
+        print(f"  {HOP_STYLE.get(h, HOP_STYLE[2])[2]:<14} {hop_counts[h]} node(s)")
+    print("Legend: star = seed | solid arrow = hop 1 | dashed arrow = hop 2 | thicker = stronger")
+
+    display(IFrame(filename, width="100%", height=height))
+    return net
+
+
+print("Defined: visualize_traversal(edges, visited)")
