@@ -2,52 +2,115 @@ EXTRACT_PROMPT = """
 You extract meaningful entity and keyword phrases from a user's question
 so they can be looked up in a systems-engineering knowledge graph.
 
-Return every phrase from the question that represents a concrete, meaningful
-entity or domain-specific keyword that can help identify a relevant node in
+Your goal is to identify phrases that can help locate relevant nodes in
 the knowledge graph.
 
-Extraction rules:
+IMPORTANT EXTRACTION RULES:
 
-1. Extract the exact phrase as it appears in the question.
+1. ALWAYS extract specific named entities when they appear in the question.
 
-2. Prefer the most specific meaningful phrase rather than an isolated
-   generic word.
+   This includes:
+   - system names
+   - product names
+   - tool names
+   - application names
+   - component names
+   - technical names
+   - proper nouns
+   - domain-specific terms
 
-3. Do not extract generic words by themselves when they do not identify
-   a specific entity, topic, or concept.
+2. A specific named entity must NOT be rejected just because it does not
+   belong to a predefined class.
 
-4. Generic words include terms such as:
-   document, documents, report, reports, information, thing, type, kind,
-   system, product, service, method, procedure, concept, etc.
+3. Extract the exact phrase as it appears in the question.
 
-5. A generic word may be included when it is part of a specific meaningful
-   phrase. Extract the complete phrase in that case.
+4. Prefer the most specific meaningful phrase rather than isolated words.
 
-6. Do not extract question words, instructions, verbs, or relationship
-   phrases such as:
-   what, which, how, why, where, is, are, used for, related to, means,
-   refers to, allow users to, find, describe, explain.
+5. Do NOT extract generic words by themselves when they only describe
+   what the user is asking about.
 
-7. Do not invent words or entities that are not present in the question.
+   Examples of generic words:
+   document, documents, report, reports, information, thing,
+   type, kind, system, product, service, method, procedure, concept
 
-8. Do not split a meaningful multi-word phrase into individual words.
+6. IMPORTANT:
+   A generic word can be part of a meaningful specific phrase.
 
-9. Extract domain-specific terminology, product names, tool names,
-   technical concepts, named entities, and specific noun phrases.
+   In that case, extract the COMPLETE phrase.
 
-10. If a generic word is only describing what the user is asking about,
-    and does not identify a specific knowledge-graph entity, do not extract
-    that generic word.
+   For example:
+   "Engineering Supplier Integration Document"
+   should be extracted as one phrase.
 
-Return ONLY the extracted phrases, separated by "|".
+7. If a generic word is only the object of a question and does not identify
+   a specific KG entity, do NOT extract it.
 
-Do not return explanations.
-Do not return JSON.
-Do not return markdown.
+8. Do NOT extract question words or relationship phrases such as:
+   what, which, how, why, where, type, kind, used for, related to,
+   means, refers to, allow users to, find, explain.
+
+9. Do NOT invent entities or words that are not present in the question.
+
+10. Do NOT split a meaningful multi-word entity into separate words.
+
+11. If a question contains both a specific entity and a generic noun,
+    extract the specific entity and ignore the generic noun.
+
+12. Return only the extracted phrases separated by "|".
+
+13. Do not return explanations.
+14. Do not return JSON.
+15. Do not return markdown.
 
 If no meaningful entity or keyword is found, return exactly:
 NONE
 
+Examples:
+
 Question:
+"What type of documents does Intellisearch allow users to find,
+and what are these documents used for?"
+
+Output:
+Intellisearch
+
+Question:
+"What is the service operation of Rolls-Royce?"
+
+Output:
+service operation|Rolls-Royce
+
+Question:
+"What is the Engineering Supplier Integration Document?"
+
+Output:
+Engineering Supplier Integration Document
+
+Question:
+"How to convert PowerPoint documents to Word?"
+
+Output:
+PowerPoint documents|Word
+
+Question:
+"What type of information does the Maintenance Management System provide?"
+
+Output:
+Maintenance Management System
+
+Question:
+"What method is used for engine monitoring?"
+
+Output:
+engine monitoring
+
+Question:
+"What is a document?"
+
+Output:
+NONE
+
+Now extract entities/keywords from this question:
+
 {query}
 """
