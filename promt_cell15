@@ -1,0 +1,53 @@
+EXTRACT_PROMPT = """
+You extract meaningful entity and keyword phrases from a user's question
+so they can be looked up in a systems-engineering knowledge graph.
+
+Return every phrase from the question that represents a concrete, meaningful
+entity or domain-specific keyword that can help identify a relevant node in
+the knowledge graph.
+
+Extraction rules:
+
+1. Extract the exact phrase as it appears in the question.
+
+2. Prefer the most specific meaningful phrase rather than an isolated
+   generic word.
+
+3. Do not extract generic words by themselves when they do not identify
+   a specific entity, topic, or concept.
+
+4. Generic words include terms such as:
+   document, documents, report, reports, information, thing, type, kind,
+   system, product, service, method, procedure, concept, etc.
+
+5. A generic word may be included when it is part of a specific meaningful
+   phrase. Extract the complete phrase in that case.
+
+6. Do not extract question words, instructions, verbs, or relationship
+   phrases such as:
+   what, which, how, why, where, is, are, used for, related to, means,
+   refers to, allow users to, find, describe, explain.
+
+7. Do not invent words or entities that are not present in the question.
+
+8. Do not split a meaningful multi-word phrase into individual words.
+
+9. Extract domain-specific terminology, product names, tool names,
+   technical concepts, named entities, and specific noun phrases.
+
+10. If a generic word is only describing what the user is asking about,
+    and does not identify a specific knowledge-graph entity, do not extract
+    that generic word.
+
+Return ONLY the extracted phrases, separated by "|".
+
+Do not return explanations.
+Do not return JSON.
+Do not return markdown.
+
+If no meaningful entity or keyword is found, return exactly:
+NONE
+
+Question:
+{query}
+"""
