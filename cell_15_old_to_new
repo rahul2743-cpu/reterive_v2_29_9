@@ -6,7 +6,7 @@
 #           that will be looked up as seed nodes in the knowledge graph
 #           (Cell 16). Everything downstream is deterministic graph work.
 # ==========================================================
-import re
+from difflib import SequenceMatcher
 
 print("=" * 80)
 print("CELL 15 — QUERY ENTITY EXTRACTION")
@@ -19,10 +19,11 @@ the graph.
 
 TASK
 Read the question and return only the TECHNICAL TERMS that name a specific
-engineering thing, copied exactly as written in the question.
+thing. The most important technical term in the question must come first.
 
 WHAT COUNTS AS A TECHNICAL ENTITY
-- System        : a complete engineered system or subsystem (e.g. "hydraulic braking system")
+- System        : an engineered system or subsystem (e.g. "hydraulic braking system", "engine"),
+                  and also a software tool, platform or product (e.g. "Intellisearch", "PLM tool")
 - Component     : a physical or logical part (e.g. "pressure sensor", "ECU", "actuator")
 - ControlFactor : a design/control parameter that can be set or tuned (e.g. "gain", "sampling rate")
 - NoiseFactor   : an uncontrollable disturbance (e.g. "ambient temperature", "vibration")
@@ -30,26 +31,41 @@ WHAT COUNTS AS A TECHNICAL ENTITY
 - Method        : a technique, algorithm or analysis (e.g. "FMEA", "Taguchi method", "Kalman filter")
 - Procedure     : a defined process or test (e.g. "calibration procedure", "hazard analysis")
 - Standard      : a standard, regulation or document ID (e.g. "ISO 26262", "IEC 61508")
-- Concept       : a domain concept that is technical and specific (e.g. "robust design", "signal-to-noise ratio")
+- Concept       : a specific technical concept or measured quantity
+                  (e.g. "robust design", "signal-to-noise ratio", "oil consumption"),
+                  and also a kind of document or artifact when the question is about it
+                  (e.g. "document", "requirements document", "test report")
 
 RULES
-1. Copy the phrase EXACTLY as it appears in the question (same spelling, same case).
+1. Copy the phrase as it appears in the question. If a word in the phrase is
+   clearly misspelled, return the correct spelling. Do not add other words.
 2. Keep multi-word technical terms together as ONE entity. Return
    "signal-to-noise ratio", not "signal", "noise", "ratio".
-3. Keep acronyms and identifiers as written (FMEA, ISO 26262, ECU, PID).
-4. Use the shortest phrase that still names the technical thing.
+3. Keep acronyms, product names and identifiers as written
+   (FMEA, ISO 26262, ECU, Intellisearch).
+4. Use the shortest phrase that still names the thing.
    Drop leading articles and generic modifiers ("the", "a", "main", "different").
 5. Do NOT return any of these:
    - question words (what, why, how, which, when, explain, describe)
-   - verbs, adjectives, adverbs
+   - verbs, adjectives, adverbs (allow, find, used, use, calculate)
    - generic words: process, system (alone), information, way, approach,
-     type, example, difference, purpose, role, importance, effect, use, step
+     type, example, difference, purpose, role, importance, effect, step, user(s)
    - anything not written in the question. Never add synonyms or expansions.
 6. If a generic word is part of a specific term, keep the full term
    ("calibration procedure" is valid, "procedure" alone is not).
-7. No duplicates. Order by importance to the question, most important first.
-8. Choose the single best class for each entity from the list above.
-   If unsure between two, use Concept.
+   Words like "provided procedure" or "given method" are NOT specific terms.
+7. A document or artifact word ("document", "report", "manual") IS valid when the
+   question asks about that thing, because it is the subject of the question.
+8. A measured quantity or performance limit (e.g. "oil consumption",
+   "fuel efficiency", "maximum allowable pressure") IS a valid entity.
+   Return the full phrase AND its core term when the core term is itself
+   a technical thing (e.g. "maximum allowable oil consumption" and "oil consumption").
+   The measured quantity is usually the main subject, so list it before the
+   system it belongs to.
+9. No duplicates (singular and plural count as the same entity).
+   Order by importance to the question, most important first.
+10. Choose the single best class for each entity from the list above.
+    If unsure between two, use Concept.
 
 OUTPUT FORMAT
 One record per line, exactly:
@@ -73,6 +89,15 @@ control factors|ControlFactor
 noise factors|NoiseFactor
 Taguchi method|Method
 
+Question: What type of document does Intellisearch allow users to find, and what are these documents used for?
+Intellisearch|System
+document|Concept
+
+Question: How do you calculate the maximum allowable oil consumption for an engine according to the provided procedure?
+maximum allowable oil consumption|Concept
+oil consumption|Concept
+engine|System
+
 Question: What is the best way to do this?
 NONE"""
 
@@ -81,7 +106,8 @@ _GENERIC = {
     "process", "system", "systems", "information", "way", "approach", "type",
     "types", "example", "examples", "difference", "purpose", "role",
     "importance", "effect", "use", "step", "steps", "thing", "things",
-    "what", "why", "how", "which", "when", "who", "explain", "describe",
+    "user", "users", "what", "why", "how", "which", "when", "who",
+    "explain", "describe", "procedure", "provided procedure",
 }
 
 _VALID_CLASSES = {
@@ -90,6 +116,32 @@ _VALID_CLASSES = {
 }
 
 _MAX_ENTITIES = 8
+
+
+def _normalize(text: str) -> str:
+    """
+    Lower-case, treat hyphens/underscores as spaces, and strip a trailing
+    plural 's' from each word so 'documents' == 'document' and
+    'control factors' == 'control factor'. Used only for comparison.
+    """
+    words = text.lower().replace("-", " ").replace("_", " ").split()
+    return " ".join(w[:-1] if len(w) > 3 and w.endswith("s") else w for w in words)
+
+
+def _in_question(key: str, q_norm: str, threshold: float = 0.85) -> bool:
+    """
+    True if the normalised phrase appears in the normalised question,
+    allowing small spelling errors (e.g. 'consumption' vs 'comsumption').
+    """
+    if key in q_norm:
+        return True
+    n = len(key.split())
+    q_words = q_norm.split()
+    for i in range(len(q_words) - n + 1):
+        window = " ".join(q_words[i:i + n])
+        if SequenceMatcher(None, key, window).ratio() >= threshold:
+            return True
+    return False
 
 
 def extract_query_entities(question: str):
@@ -101,7 +153,7 @@ def extract_query_entities(question: str):
 
     Returns:
         list[tuple[str, str]]: (phrase, class_hint) pairs, most important first.
-            phrase     : exact technical phrase found in the question
+            phrase     : technical phrase found in the question
             class_hint : System, Component, ControlFactor, NoiseFactor,
                          ErrorState, Method, Procedure, Standard or Concept
 
@@ -109,7 +161,9 @@ def extract_query_entities(question: str):
         - Never raises. LLM failure degrades to [].
         - "NONE" from the LLM returns [].
         - Code-level filters remove generic words, duplicates, and any phrase
-          that does not actually appear in the question (hallucination guard).
+          that does not appear in the question (hallucination guard).
+          Matching ignores case, hyphens and plural 's', and tolerates
+          small spelling errors in the user's question.
         - Cell 16 falls back to lexical matching when [] is returned.
     """
     try:
@@ -125,7 +179,7 @@ def extract_query_entities(question: str):
     if text.upper().startswith("NONE"):
         return []
 
-    q_lower = question.lower()
+    q_norm = _normalize(question)
     out, seen = [], set()
 
     for line in text.splitlines():
@@ -139,15 +193,15 @@ def extract_query_entities(question: str):
 
         if not phrase:
             continue
-        key = phrase.lower()
+        key = _normalize(phrase)
 
-        # 1. drop generic single words
-        if key in _GENERIC:
+        # 1. drop generic words
+        if key in _GENERIC or phrase.lower() in _GENERIC:
             continue
-        # 2. hallucination guard: phrase must occur in the question
-        if key not in q_lower:
+        # 2. hallucination guard (fuzzy, tolerates typos in the question)
+        if not _in_question(key, q_norm):
             continue
-        # 3. dedupe
+        # 3. dedupe (singular/plural treated the same)
         if key in seen:
             continue
         # 4. normalise class
