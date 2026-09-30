@@ -7,22 +7,27 @@
 # Output format:
 #
 # {
-#     "predictions": [
+#   "predictions": [
+#     {
+#       "data": [
 #         {
-#             "data": [
-#                 {
-#                     "content": "...",
-#                     "title": "...",
-#                     "reference": "..."
-#                 }
-#             ]
+#           "content": "...",
+#           "title": "...",
+#           "reference": "..."
 #         }
-#     ]
+#       ]
+#     }
+#   ]
 # }
 #
 # ==========================================================
 
-TOP_K = globals().get("TOP_K", 10)
+import json
+
+
+# ==========================================================
+# 1. CHECK REQUIRED VARIABLE
+# ==========================================================
 
 if "ranked_chunks" not in globals():
     raise RuntimeError(
@@ -31,14 +36,30 @@ if "ranked_chunks" not in globals():
 
 
 # ==========================================================
-# 1. TAKE TOP-K FROM EXISTING RANK
+# 2. TOP-K CONFIGURATION
+# ==========================================================
+
+TOP_K = globals().get("TOP_K", 10)
+
+
+# ==========================================================
+# 3. TAKE TOP-K FROM EXISTING RANK
+# ==========================================================
+#
+# Cell 18 has already ranked all chunks.
+# Here we simply take the first TOP_K chunks.
+#
+# No new scoring
+# No MMR
+# No re-ranking
+#
 # ==========================================================
 
 chosen = ranked_chunks[:TOP_K]
 
 
 # ==========================================================
-# 2. BUILD EXACT REQUIRED FORMAT
+# 4. BUILD REQUIRED OUTPUT STRUCTURE
 # ==========================================================
 
 result = {
@@ -58,7 +79,7 @@ result = {
 
 
 # ==========================================================
-# 3. DISPLAY
+# 5. SUMMARY
 # ==========================================================
 
 print("=" * 80)
@@ -69,12 +90,27 @@ print(f"Total ranked chunks : {len(ranked_chunks)}")
 print(f"TOP_K               : {TOP_K}")
 print(f"Selected chunks     : {len(chosen)}")
 
+
+# ==========================================================
+# 6. PRETTY PRINT FINAL OUTPUT
+# ==========================================================
+
 print()
-print(result)
+print("=" * 80)
+print("FINAL TOP-K OUTPUT")
+print("=" * 80)
+
+print(
+    json.dumps(
+        result,
+        indent=2,
+        ensure_ascii=False
+    )
+)
 
 
 # ==========================================================
-# 4. FINAL OUTPUT
+# 7. FINAL VARIABLE
 # ==========================================================
 
-result
+top_k_result = result
