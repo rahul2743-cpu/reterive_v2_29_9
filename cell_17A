@@ -1,0 +1,301 @@
+# ==========================================================
+# CELL 17A — GRAPH EVIDENCE → DOCUMENT RETRIEVAL
+# ==========================================================
+#
+# Input : all_edges, reached_nodes (Cell 16B), g (Cell 11),
+#         knowledge_nodes (Cell 6), EX (Cell 13)
+#
+# Output: document_scores_df, ranked_documents, ranked_document_content
+#
+# Flow:
+#   graph evidence (seed nodes + traversed edges)
+#        ↓  RDF URI -> node_id -> doc_id
+#   aggregate graph_score per document
+#        ↓
+#   rank documents
+#        ↓
+#   fetch content for the top documents only
+#
+# NO chunking, NO BM25, NO LLM here.
+# ==========================================================
+
+import pandas as pd
+from collections import defaultdict
+from rdflib import URIRef
+from pyspark.sql import functions as F
+
+
+def _cfg(name, default):
+    """Use the value from Cell 13 if it exists, otherwise the default."""
+    return globals().get(name, default)
+
+
+print("=" * 80)
+print("CELL 17A — GRAPH EVIDENCE → DOCUMENT RETRIEVAL")
+print("=" * 80)
+
+
+# ==========================================================
+# 1. CHECK REQUIRED VARIABLES
+# ==========================================================
+
+REQUIRED_17A = ["all_edges", "reached_nodes", "g", "EX", "knowledge_nodes"]
+
+_missing = [x for x in REQUIRED_17A if x not in globals()]
+
+if _missing:
+    raise RuntimeError(
+        f"Missing variables: {_missing}. Run Cells 6, 13 and 16B first."
+    )
+
+MAX_DOCS_17A = _cfg("MAX_DOCS", 10)
+print(f"MAX_DOCS = {MAX_DOCS_17A}")
+
+
+# ==========================================================
+# 2. BUILD node_id → DOCUMENT INDEX   (metadata only, no text)
+# ==========================================================
+
+node_document_index = {}
+
+for row in knowledge_nodes.select(
+    "doc_id", "source", "node_id", "node_name"
+).toLocalIterator():
+
+    node_id = str(row["node_id"]).strip()
+
+    if node_id:
+        node_document_index[node_id] = {
+            "doc_id":    row["doc_id"],
+            "source":    row["source"],
+            "node_id":   node_id,
+            "node_name": row["node_name"],
+        }
+
+print()
+print(f"KG node → document mappings : {len(node_document_index)}")
+
+
+# ==========================================================
+# 3. RESOLVE RDF URI → node_id
+# ==========================================================
+#
+# Cell 11 stores the original reference on every entity as
+# ex:sourceReference (documents) or ex:targetReference (link targets).
+#
+# IMPORTANT: all_edges holds URIs as plain strings, but rdflib only
+# matches URIRef objects. g.value("http://...") silently returns None,
+# so the string MUST be wrapped in URIRef(...).
+# ==========================================================
+
+def get_node_reference(uri):
+
+    subject = URIRef(str(uri))
+
+    for prop in (EX.sourceReference, EX.targetReference):
+        ref = g.value(subject, prop)
+        if ref is not None:
+            return str(ref).strip()
+
+    return None
+
+
+# ==========================================================
+# 4. COLLECT GRAPH EVIDENCE PER DOCUMENT
+# ==========================================================
+#
+# A document gets evidence from two places:
+#
+#   TARGET of a traversed edge -> the edge's graph_score.
+#       (a document reached by several paths gets several pieces of evidence)
+#
+#   SEED node (hop 0)          -> its own seed score, ONCE.
+#       Seeds are the best matches for the question, but they only ever
+#       appear as the SOURCE of an edge, and a seed with no outgoing edge
+#       would never appear in all_edges at all.
+#
+# Source endpoints of edges are NOT credited. An edge's graph_score
+# describes the node it leads TO. Crediting the source with it gives a
+# node with many outgoing links (a hub) one full score per link.
+# ==========================================================
+
+document_evidence = defaultdict(list)
+unresolved_nodes  = set()
+
+
+def add_evidence(uri, graph_score, hop, strength, predicate, role):
+
+    node_id = get_node_reference(uri)
+
+    if node_id is None:
+        unresolved_nodes.add(str(uri))
+        return
+
+    doc = node_document_index.get(node_id)
+
+    if doc is None:
+        unresolved_nodes.add(node_id)      # linked page that is not in the loaded XML set
+        return
+
+    document_evidence[doc["doc_id"]].append({
+        "doc_id":      doc["doc_id"],
+        "node_id":     node_id,
+        "node_name":   doc["node_name"],
+        "source":      doc["source"],
+        "graph_score": float(graph_score),
+        "hop":         hop,
+        "strength":    strength,
+        "predicate":   predicate,
+        "role":        role,
+    })
+
+
+# ---- seeds ----
+for uri, info in reached_nodes.items():
+    if info.get("hop") == 0:
+        add_evidence(uri, info["graph_score"], 0, None, None, "seed")
+
+# ---- traversed edges (target side) ----
+for edge in all_edges:
+    add_evidence(
+        edge["target"], edge["graph_score"], edge["hop"],
+        edge["strength"], edge["predicate"], "target",
+    )
+
+
+print()
+print("=" * 80)
+print("EVIDENCE → DOCUMENT MAPPING")
+print("=" * 80)
+print(f"Graph edges from Cell 16B : {len(all_edges)}")
+print(f"Seed nodes                : {sum(1 for i in reached_nodes.values() if i.get('hop') == 0)}")
+print(f"Documents with evidence   : {len(document_evidence)}")
+print(f"Unresolved nodes          : {len(unresolved_nodes)}   (no page in the loaded XML set)")
+
+
+# ==========================================================
+# 5. AGGREGATE PER DOCUMENT
+# ==========================================================
+#
+#   document_score = sum of graph_score over all its evidence
+#   (graph_score itself is NOT recalculated — it comes from Cell 16B)
+# ==========================================================
+
+document_scores = []
+
+for doc_id, ev in document_evidence.items():
+
+    first = ev[0]
+
+    document_scores.append({
+        "doc_id":          doc_id,
+        "node_id":         first["node_id"],
+        "node_name":       first["node_name"],
+        "source":          first["source"],
+        "document_score":  sum(e["graph_score"] for e in ev),
+        "max_graph_score": max(e["graph_score"] for e in ev),
+        "best_hop":        min(e["hop"] for e in ev),
+        "evidence_count":  len(ev),
+    })
+
+
+# ==========================================================
+# 6. RANK   (score DESC, strongest evidence DESC, closest hop ASC)
+# ==========================================================
+
+ranked_documents = sorted(
+    document_scores,
+    key=lambda x: (-x["document_score"], -x["max_graph_score"], x["best_hop"]),
+)
+
+top_documents = ranked_documents[:MAX_DOCS_17A]
+
+document_scores_df = pd.DataFrame(top_documents)
+
+if not document_scores_df.empty:
+    document_scores_df.insert(0, "rank", range(1, len(document_scores_df) + 1))
+
+print()
+print("=" * 80)
+print("TOP RANKED DOCUMENTS")
+print("=" * 80)
+
+if document_scores_df.empty:
+    print("No documents were retrieved.")
+else:
+    display(document_scores_df[[
+        "rank", "doc_id", "node_name", "document_score",
+        "max_graph_score", "best_hop", "evidence_count", "source",
+    ]])
+
+assert top_documents, (
+    "No document could be linked to the graph evidence. "
+    "Check that seed_nodes exist and that Cell 11 stored ex:sourceReference / ex:targetReference."
+)
+
+
+# ==========================================================
+# 7. FETCH CONTENT FOR THE TOP DOCUMENTS ONLY
+# ==========================================================
+
+top_doc_ids = [x["doc_id"] for x in top_documents]
+rank_lookup = {x["doc_id"]: i + 1 for i, x in enumerate(top_documents)}
+
+print()
+print(f"Top document IDs: {top_doc_ids}")
+
+ranked_document_content = []
+
+for row in (
+    knowledge_nodes
+    .filter(F.col("doc_id").isin(top_doc_ids))
+    .select("doc_id", "source", "node_id", "node_name", "node_content")
+    .toLocalIterator()
+):
+    ranked_document_content.append({
+        "rank":      rank_lookup.get(row["doc_id"]),
+        "doc_id":    row["doc_id"],
+        "source":    row["source"],
+        "node_id":   row["node_id"],
+        "node_name": row["node_name"],
+        "content":   row["node_content"],
+    })
+
+# Spark does not keep order, so sort by the rank we attached
+ranked_document_content.sort(key=lambda x: x["rank"])
+
+# Informational check: Cells 4 and 6 normally leave one row per doc_id.
+# If that ever changes, 17B still works (each row is chunked on its own),
+# but you should know about it.
+if len(ranked_document_content) != len(top_doc_ids):
+    print(
+        f"⚠️  Selected {len(top_doc_ids)} doc_ids but fetched "
+        f"{len(ranked_document_content)} rows — some doc_ids have more than "
+        "one knowledge node. Each row will be chunked separately in 17B."
+    )
+
+
+# ==========================================================
+# 8. DISPLAY
+# ==========================================================
+
+print()
+print("=" * 80)
+print("FETCHED DOCUMENT CONTENT")
+print("=" * 80)
+
+for doc in ranked_document_content:
+    print()
+    print(f"Rank    : {doc['rank']}")
+    print(f"doc_id  : {doc['doc_id']}")
+    print(f"Node    : {doc['node_name']}")
+    print(f"Content : {len(doc['content'] or '')} characters")
+    print("-" * 80)
+    print((doc["content"] or "")[:500])
+
+print()
+print("=" * 80)
+print("CELL 17A COMPLETED")
+print("=" * 80)
+print(f"Documents selected : {len(ranked_document_content)}")
+print("Ready for Cell 17B → Chunking + Chunk Ranking")
