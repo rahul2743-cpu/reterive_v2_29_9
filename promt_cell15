@@ -1,92 +1,153 @@
 EXTRACT_PROMPT = """
-You extract entity and meaningful keyword phrases from a user's question
-for lookup in a systems-engineering Knowledge Graph.
+You are an entity and keyword extractor for a systems-engineering
+Knowledge Graph retrieval system.
 
-Extract phrases that can help identify relevant KG nodes.
+Your task is to extract meaningful phrases from the user's question
+that can be used to search for relevant nodes in the Knowledge Graph.
 
-RULES:
+IMPORTANT RULES:
 
-1. Extract specific named entities when they appear in the question.
-   This includes system names, application names, tool names, product names,
-   component names, technical terms, and other domain-specific entities.
+1. Extract specific entities, named entities, and meaningful
+   domain-specific phrases from the question.
 
-2. Extract the exact phrase as it appears in the question.
+2. Extract the exact wording from the question whenever possible.
 
-3. Do not require an entity to belong to a predefined class.
-   The entity linker will determine whether the extracted phrase exists
-   in the Knowledge Graph.
+3. A meaningful phrase can be:
+   - a system name
+   - an application name
+   - a tool name
+   - a product name
+   - a component
+   - a technical term
+   - a domain-specific concept
+   - a method or procedure
+   - a standard
+   - a named document
+   - a failure mode
+   - any other specific term that could identify a KG node
 
-4. Do not extract generic words by themselves when they only describe
-   what the question is asking about.
+4. DO NOT require the extracted phrase to belong to a predefined
+   entity class. The Knowledge Graph entity-linking step will determine
+   whether the phrase matches an actual KG node.
 
-   Examples:
+5. DO NOT extract generic words by themselves when they only describe
+   what the user is asking about.
+
+   Examples of generic words:
    document
    documents
    report
    reports
    information
+   thing
    type
    kind
-   thing
+   method
+   system
+   product
+   service
 
-5. If a generic word is part of a specific meaningful phrase, keep the
-   complete phrase.
+6. A generic word CAN be included when it is part of a specific,
+   meaningful phrase. In that case, keep the COMPLETE phrase.
 
-6. Do not extract question words, verbs, or relationship phrases such as:
-   what, which, how, why, type, kind, used for, related to, allow users to,
-   find, explain.
+7. Do not extract question words or question-structure phrases such as:
+   what
+   which
+   who
+   how
+   why
+   where
+   type
+   kind
+   used for
+   related to
+   means
+   refers to
+   allow users to
+   find
+   explain
 
-7. Do not invent words that are not present in the question.
+8. Do not extract ordinary verbs or filler words unless they are part
+   of a meaningful technical phrase.
 
-8. Do not split a meaningful multi-word entity.
+9. Do not split a meaningful multi-word phrase into separate words.
 
-9. If a specific entity appears together with a generic noun, extract the
-   specific entity.
+10. Do not invent entities or keywords that are not present in the
+    user's question.
 
-10. Return ONLY the extracted phrases separated by "|".
+11. If a specific entity appears together with a generic word,
+    extract the specific entity or the complete meaningful phrase,
+    not the generic word alone.
 
-11. Do not return entity classes.
-12. Do not return explanations.
-13. Do not return JSON.
-14. Do not return markdown.
+12. Return ONLY the extracted phrases separated by "|".
 
-If no meaningful entity or keyword is present, return exactly:
-NONE
+13. Do NOT return:
+    - explanations
+    - entity types
+    - JSON
+    - markdown
+    - confidence scores
+    - additional text
 
-Examples:
+14. If no meaningful entity or keyword is present, return exactly:
+    NONE
+
+
+EXAMPLES:
 
 Question:
-"What type of documents does Intellisearch allow users to find?"
+What type of documents does Intellisearch allow users to find,
+and what are these documents used for?
+
 Output:
 Intellisearch
 
+
 Question:
-"What is the service operation of Rolls-Royce?"
+What is meant by service operation in the Rolls-Royce context?
+
 Output:
 service operation|Rolls-Royce
 
+
 Question:
-"What is the Engineering Supplier Integration Document?"
+What is the Engineering Supplier Integration Document?
+
 Output:
 Engineering Supplier Integration Document
 
+
 Question:
-"How to convert PowerPoint documents to Word?"
+How to convert PowerPoint documents to Word?
+
 Output:
 PowerPoint documents|Word
 
+
 Question:
-"What method is used for engine monitoring?"
+How to highlight acronyms in Word documents?
+
+Output:
+acronyms|Word documents
+
+
+Question:
+What method is used for engine monitoring?
+
 Output:
 engine monitoring
 
+
 Question:
-"What is a document?"
+What is a document?
+
 Output:
 NONE
 
-Question:
+
+NOW EXTRACT FROM THIS QUESTION:
+
 {query}
 
-Output:
+OUTPUT:
 """
