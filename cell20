@@ -1,0 +1,292 @@
+# ==========================================================
+# CELL 20 — CONTEXT BUILDER + LLM RESPONSE
+# ==========================================================
+#
+# Input :
+#   ranked_chunks  → ALL ranked chunks from Cell 18
+#   query_info     → Original user query
+#   llm            → Configured LLM
+#
+# Output :
+#   context        → Context passed to the LLM
+#   final_answer   → Final LLM response
+#
+# Flow:
+#
+#   ALL ranked chunks
+#          ↓
+#   Context builder
+#          ↓
+#   Context-size limit
+#          ↓
+#   LLM
+#          ↓
+#   Final answer
+#
+# NO retrieval
+# NO ranking
+# NO MMR
+# NO BM25
+# NO embeddings
+# ==========================================================
+
+
+print("=" * 80)
+print("CELL 20 — CONTEXT BUILDER + LLM RESPONSE")
+print("=" * 80)
+
+
+# ==========================================================
+# 1. VALIDATION
+# ==========================================================
+
+if "ranked_chunks" not in globals():
+    raise RuntimeError(
+        "ranked_chunks not found. Run Cell 18 first."
+    )
+
+if "query_info" not in globals():
+    raise RuntimeError(
+        "query_info not found."
+    )
+
+if "llm" not in globals():
+    raise RuntimeError(
+        "llm not found. Run your LLM configuration cell first."
+    )
+
+
+# ==========================================================
+# 2. CONFIGURATION
+# ==========================================================
+
+CONTEXT_MAX_CHARS = 14000
+
+
+# ==========================================================
+# 3. GET USER QUERY
+# ==========================================================
+
+query = query_info["original_query"]
+
+print()
+print("USER QUERY")
+print("-" * 80)
+print(query)
+
+
+# ==========================================================
+# 4. BUILD CONTEXT FROM RANKED CHUNKS
+# ==========================================================
+#
+# Cell 18 has already ranked ALL chunks:
+#
+#   Rank 1
+#   Rank 2
+#   Rank 3
+#   ...
+#   Rank N
+#
+# We take them in that existing order.
+#
+# We stop only when CONTEXT_MAX_CHARS is reached.
+#
+# ==========================================================
+
+context_parts = []
+context_length = 0
+
+
+for rank, chunk in enumerate(
+    ranked_chunks,
+    start=1
+):
+
+    content = str(
+        chunk.get("content", "")
+    ).strip()
+
+    title = str(
+        chunk.get("node_name", "")
+    ).strip()
+
+    reference = str(
+        chunk.get("source", "")
+    ).strip()
+
+
+    # ------------------------------------------------------
+    # Skip empty chunks
+    # ------------------------------------------------------
+
+    if not content:
+        continue
+
+
+    # ------------------------------------------------------
+    # Create context block
+    # ------------------------------------------------------
+
+    chunk_context = (
+        f"--- CONTEXT CHUNK {rank} ---\n"
+        f"Title: {title}\n"
+        f"Reference: {reference}\n\n"
+        f"Content:\n{content}\n"
+    )
+
+
+    # ------------------------------------------------------
+    # Check context-size limit
+    # ------------------------------------------------------
+
+    if (
+        context_length + len(chunk_context)
+        > CONTEXT_MAX_CHARS
+    ):
+        break
+
+
+    context_parts.append(
+        chunk_context
+    )
+
+    context_length += len(
+        chunk_context
+    )
+
+
+# ==========================================================
+# 5. COMBINE CONTEXT
+# ==========================================================
+
+context = "\n".join(
+    context_parts
+).strip()
+
+
+# ==========================================================
+# 6. VALIDATE CONTEXT
+# ==========================================================
+
+if not context:
+    raise RuntimeError(
+        "No chunks could be added to the context."
+    )
+
+
+# ==========================================================
+# 7. CONTEXT SUMMARY
+# ==========================================================
+
+print()
+print("=" * 80)
+print("CONTEXT BUILT")
+print("=" * 80)
+
+print(
+    f"Total ranked chunks : {len(ranked_chunks)}"
+)
+
+print(
+    f"Chunks used         : {len(context_parts)}"
+)
+
+print(
+    f"Context length      : {len(context)} characters"
+)
+
+
+# ==========================================================
+# 8. DISPLAY CONTEXT
+# ==========================================================
+
+print()
+print("=" * 80)
+print("RETRIEVED CONTEXT")
+print("=" * 80)
+
+print(context)
+
+
+# ==========================================================
+# 9. BUILD LLM PROMPT
+# ==========================================================
+
+prompt = f"""
+You are a Knowledge Graph Retrieval-Augmented Generation
+(KG-RAG) assistant.
+
+Answer the user's question using ONLY the retrieved context
+provided below.
+
+USER QUESTION:
+{query}
+
+RETRIEVED CONTEXT:
+{context}
+
+INSTRUCTIONS:
+
+1. Answer the user's question directly.
+
+2. Use only information present in the retrieved context.
+
+3. Do not introduce information from outside the retrieved context.
+
+4. Do not make up or assume facts.
+
+5. Combine information from multiple context chunks when necessary.
+
+6. Ignore repeated information caused by chunk overlap.
+
+7. If the retrieved context does not contain enough information
+   to answer the question, clearly state that the available
+   context is insufficient.
+
+FINAL ANSWER:
+"""
+
+
+# ==========================================================
+# 10. CALL LLM
+# ==========================================================
+
+print()
+print("=" * 80)
+print("CALLING LLM")
+print("=" * 80)
+
+response = llm.invoke(
+    prompt
+)
+
+
+# ==========================================================
+# 11. EXTRACT FINAL ANSWER
+# ==========================================================
+
+final_answer = response.content
+
+
+# ==========================================================
+# 12. DISPLAY FINAL ANSWER
+# ==========================================================
+
+print()
+print("=" * 80)
+print("FINAL KG-RAG RESPONSE")
+print("=" * 80)
+
+print(final_answer)
+
+print("=" * 80)
+
+
+# ==========================================================
+# 13. FINAL OUTPUT
+# ==========================================================
+
+print()
+print("Output variables:")
+print("  context      → Context sent to the LLM")
+print("  final_answer → Final LLM response")
