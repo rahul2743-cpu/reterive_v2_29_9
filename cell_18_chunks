@@ -1,0 +1,438 @@
+# ==========================================================
+# CELL 18 — GLOBAL GREEDY MMR CHUNK RANKING
+# ==========================================================
+#
+# Input :
+#   document_chunks (Cell 17B)
+#   QUERY
+#
+# Output :
+#   ranked_chunks
+#   ranked_chunks_df
+#
+# Purpose:
+#   Rank ALL chunks from ALL selected documents using
+#   Global Greedy MMR.
+#
+# IMPORTANT:
+#   - NO Top-K selection here
+#   - NO MAX_PER_DOC restriction here
+#   - ALL chunks are ranked
+#   - Top-K will be selected in the NEXT cell
+#
+# Ranking signal:
+#   1. Query → Chunk relevance
+#   2. Chunk → Previously selected chunk redundancy
+#
+# Similarity:
+#   TF-IDF cosine similarity
+#
+# NO BM25
+# NO embeddings
+# NO LLM
+# ==========================================================
+
+import re
+import numpy as np
+import pandas as pd
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# ==========================================================
+# 1. CHECK REQUIRED VARIABLES
+# ==========================================================
+
+for n in ("document_chunks", "QUERY"):
+    if n not in globals():
+        raise RuntimeError(
+            f"Missing '{n}'. Run Cell 17B first and make sure QUERY exists."
+        )
+
+
+# ==========================================================
+# 2. CONFIGURATION
+# ==========================================================
+
+MMR_LAMBDA_18 = 0.70
+
+print("=" * 80)
+print("CELL 18 — GLOBAL GREEDY MMR CHUNK RANKING")
+print("=" * 80)
+
+print(f"Candidate chunks : {len(document_chunks)}")
+print(f"MMR lambda       : {MMR_LAMBDA_18}")
+print("Top-K selection  : NOT performed in this cell")
+
+
+# ==========================================================
+# 3. TEXT NORMALIZATION
+# ==========================================================
+
+def normalize_text(text):
+
+    text = str(text or "").lower()
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+query_text = normalize_text(QUERY)
+
+candidate_texts = [
+    normalize_text(chunk["content"])
+    for chunk in document_chunks
+]
+
+
+# ==========================================================
+# 4. REMOVE EMPTY CHUNKS
+# ==========================================================
+
+valid_indices = [
+    i
+    for i, text in enumerate(candidate_texts)
+    if text
+]
+
+if not valid_indices:
+    raise RuntimeError(
+        "No non-empty chunks available for ranking."
+    )
+
+candidates = [
+    document_chunks[i]
+    for i in valid_indices
+]
+
+candidate_texts = [
+    candidate_texts[i]
+    for i in valid_indices
+]
+
+print(f"Valid chunks     : {len(candidates)}")
+
+
+# ==========================================================
+# 5. TF-IDF REPRESENTATION
+# ==========================================================
+#
+# One common TF-IDF space is created for:
+#
+#       QUERY
+#         +
+#       ALL CHUNKS
+#
+# This allows us to calculate:
+#
+#   Query ↔ Chunk similarity
+#   Chunk ↔ Chunk similarity
+#
+# ==========================================================
+
+vectorizer = TfidfVectorizer(
+    lowercase=True,
+    ngram_range=(1, 2),
+    min_df=1,
+)
+
+tfidf_matrix = vectorizer.fit_transform(
+    [query_text] + candidate_texts
+)
+
+query_vector = tfidf_matrix[0]
+
+chunk_vectors = tfidf_matrix[1:]
+
+
+# ==========================================================
+# 6. QUERY → CHUNK RELEVANCE
+# ==========================================================
+#
+# query_score[i] =
+# cosine similarity(Query, Chunk_i)
+#
+# This is the relevance component of MMR.
+#
+# ==========================================================
+
+query_similarity = cosine_similarity(
+    chunk_vectors,
+    query_vector
+).reshape(-1)
+
+
+for i, score in enumerate(query_similarity):
+
+    candidates[i]["query_score"] = float(score)
+
+
+# ==========================================================
+# 7. GLOBAL GREEDY MMR
+# ==========================================================
+#
+# IMPORTANT:
+#
+# We do NOT stop at TOP_K.
+#
+# We continue until EVERY candidate chunk has been
+# assigned a position in the MMR ranking.
+#
+# MMR formula:
+#
+# MMR(c) =
+#     λ × relevance(c)
+#     -
+#     (1 - λ) × redundancy(c)
+#
+# redundancy(c) =
+#     maximum similarity between candidate c
+#     and ANY previously selected chunk.
+#
+# ==========================================================
+
+remaining = set(range(len(candidates)))
+
+selected_indices = []
+
+ranked_chunks = []
+
+
+while remaining:
+
+    best_index = None
+    best_mmr = -float("inf")
+    best_redundancy = 0.0
+
+
+    # ------------------------------------------------------
+    # Evaluate EVERY remaining candidate
+    # ------------------------------------------------------
+
+    for i in remaining:
+
+        # --------------------------------------------------
+        # Query relevance
+        # --------------------------------------------------
+
+        relevance = float(
+            candidates[i]["query_score"]
+        )
+
+
+        # --------------------------------------------------
+        # Redundancy
+        # --------------------------------------------------
+        #
+        # First selected chunk:
+        #     redundancy = 0
+        #
+        # Later:
+        #     maximum similarity to ANY selected chunk
+        # --------------------------------------------------
+
+        if not selected_indices:
+
+            redundancy = 0.0
+
+        else:
+
+            similarities = cosine_similarity(
+                chunk_vectors[i],
+                chunk_vectors[selected_indices]
+            ).reshape(-1)
+
+            redundancy = float(
+                np.max(similarities)
+            )
+
+
+        # --------------------------------------------------
+        # MMR calculation
+        # --------------------------------------------------
+
+        mmr_score = (
+            MMR_LAMBDA_18 * relevance
+            -
+            (1.0 - MMR_LAMBDA_18) * redundancy
+        )
+
+
+        # --------------------------------------------------
+        # Keep best candidate for this iteration
+        # --------------------------------------------------
+
+        if mmr_score > best_mmr:
+
+            best_mmr = mmr_score
+            best_index = i
+            best_redundancy = redundancy
+
+
+    # ------------------------------------------------------
+    # Safety check
+    # ------------------------------------------------------
+
+    if best_index is None:
+        break
+
+
+    # ------------------------------------------------------
+    # Add selected chunk to ranking
+    # ------------------------------------------------------
+
+    candidate = candidates[best_index].copy()
+
+    candidate["selection_rank"] = len(ranked_chunks) + 1
+
+    candidate["redundancy_score"] = float(
+        best_redundancy
+    )
+
+    candidate["mmr_score"] = float(
+        best_mmr
+    )
+
+    ranked_chunks.append(candidate)
+
+    selected_indices.append(best_index)
+
+    remaining.remove(best_index)
+
+
+# ==========================================================
+# 8. VERIFY ALL CHUNKS WERE RANKED
+# ==========================================================
+
+assert len(ranked_chunks) == len(candidates), (
+    f"Expected {len(candidates)} ranked chunks, "
+    f"but got {len(ranked_chunks)}."
+)
+
+
+# ==========================================================
+# 9. CREATE DATAFRAME
+# ==========================================================
+
+ranked_chunks_df = pd.DataFrame(
+    ranked_chunks
+)
+
+
+# ==========================================================
+# 10. DISPLAY RANKING SUMMARY
+# ==========================================================
+
+print()
+print("=" * 80)
+print("GLOBAL MMR RANKING COMPLETED")
+print("=" * 80)
+
+print(f"Total input chunks  : {len(document_chunks)}")
+print(f"Valid chunks        : {len(candidates)}")
+print(f"Ranked chunks       : {len(ranked_chunks)}")
+
+print()
+print("ALL chunks have been ranked.")
+print("Top-K selection will happen in the next cell.")
+
+
+# ==========================================================
+# 11. DISPLAY RANKED CHUNKS
+# ==========================================================
+
+print()
+print("=" * 80)
+print("RANKED CHUNKS")
+print("=" * 80)
+
+display(
+    ranked_chunks_df[
+        [
+            "selection_rank",
+            "doc_id",
+            "node_name",
+            "chunk_id",
+            "query_score",
+            "redundancy_score",
+            "mmr_score",
+            "document_score",
+            "best_hop",
+        ]
+    ]
+)
+
+
+# ==========================================================
+# 12. DISPLAY FIRST 10 RANKED CHUNKS
+# ==========================================================
+#
+# This is ONLY for viewing.
+# It does NOT create the Top-K output.
+#
+# ==========================================================
+
+print()
+print("=" * 80)
+print("FIRST 10 RANKED CHUNKS — DISPLAY ONLY")
+print("=" * 80)
+
+for chunk in ranked_chunks[:10]:
+
+    print()
+    print(
+        f"Rank       : {chunk['selection_rank']}"
+    )
+
+    print(
+        f"Document   : {chunk['doc_id']}"
+    )
+
+    print(
+        f"Node       : {chunk['node_name']}"
+    )
+
+    print(
+        f"Chunk      : "
+        f"{chunk['chunk_id'] + 1}/{chunk['n_chunks']}"
+    )
+
+    print(
+        f"Query score: "
+        f"{chunk['query_score']:.4f}"
+    )
+
+    print(
+        f"Redundancy : "
+        f"{chunk['redundancy_score']:.4f}"
+    )
+
+    print(
+        f"MMR score  : "
+        f"{chunk['mmr_score']:.4f}"
+    )
+
+    print("-" * 80)
+
+    print(
+        chunk["content"]
+    )
+
+
+# ==========================================================
+# 13. FINAL
+# ==========================================================
+
+print()
+print("=" * 80)
+print("CELL 18 COMPLETED")
+print("=" * 80)
+
+print(
+    f"ALL {len(ranked_chunks)} chunks are ranked."
+)
+
+print(
+    "Next cell → select TOP_K chunks from ranked_chunks."
+)
