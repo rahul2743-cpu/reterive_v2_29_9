@@ -4,24 +4,22 @@
 #
 # Input  : ranked_chunks (Cell 18)
 #
-# Output : chosen
-#
 # Output format:
-# [
-#     {
-#         "content": "...",
-#         "title": "...",
-#         "reference": "..."
-#     },
-#     ...
-# ]
 #
-# Cell 18 has already ranked ALL chunks.
-# Cell 19 only takes the Top-K according to that rank.
+# {
+#     "predictions": [
+#         {
+#             "data": [
+#                 {
+#                     "content": "...",
+#                     "title": "...",
+#                     "reference": "..."
+#                 }
+#             ]
+#         }
+#     ]
+# }
 #
-# NO new scoring
-# NO MMR
-# NO re-ranking
 # ==========================================================
 
 TOP_K = globals().get("TOP_K", 10)
@@ -40,21 +38,27 @@ chosen = ranked_chunks[:TOP_K]
 
 
 # ==========================================================
-# 2. CONVERT TO REQUIRED FORMAT
+# 2. BUILD EXACT REQUIRED FORMAT
 # ==========================================================
 
-top_k_chunks = [
-    {
-        "content": c["content"],
-        "title": c["node_name"],
-        "reference": c["source"],
-    }
-    for c in chosen
-]
+result = {
+    "predictions": [
+        {
+            "data": [
+                {
+                    "content": c["content"],
+                    "title": c["node_name"],
+                    "reference": c["source"]
+                }
+                for c in chosen
+            ]
+        }
+    ]
+}
 
 
 # ==========================================================
-# 3. DISPLAY OUTPUT
+# 3. DISPLAY
 # ==========================================================
 
 print("=" * 80)
@@ -63,29 +67,14 @@ print("=" * 80)
 
 print(f"Total ranked chunks : {len(ranked_chunks)}")
 print(f"TOP_K               : {TOP_K}")
-print(f"Selected chunks     : {len(top_k_chunks)}")
+print(f"Selected chunks     : {len(chosen)}")
 
 print()
-print("TOP-K CHUNKS")
-print("=" * 80)
-
-for i, c in enumerate(top_k_chunks, start=1):
-
-    print()
-    print(f"Chunk {i}")
-    print("-" * 80)
-    print(f"Title     : {c['title']}")
-    print(f"Reference : {c['reference']}")
-    print(f"Content   : {c['content']}")
+print(result)
 
 
 # ==========================================================
 # 4. FINAL OUTPUT
 # ==========================================================
 
-print()
-print("=" * 80)
-print("CELL 19 COMPLETED")
-print("=" * 80)
-
-print("Output variable: top_k_chunks")
+result
