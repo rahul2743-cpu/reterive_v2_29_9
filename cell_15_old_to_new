@@ -1,0 +1,166 @@
+# ==========================================================
+# Cell 15 : QUERY -> ENTITY PHRASES (seed-node extraction)
+#
+#           The only LLM call before retrieval. It does NOT answer the
+#           question. It only picks the TECHNICAL terms in the question
+#           that will be looked up as seed nodes in the knowledge graph
+#           (Cell 16). Everything downstream is deterministic graph work.
+# ==========================================================
+import re
+
+print("=" * 80)
+print("CELL 15 — QUERY ENTITY EXTRACTION")
+print("=" * 80)
+
+EXTRACT_PROMPT = """You are a technical entity extractor for a systems-engineering
+knowledge graph. Your output is used to pick SEED NODES in the graph, so precision
+matters more than quantity. A wrong or generic entity pulls in the wrong part of
+the graph.
+
+TASK
+Read the question and return only the TECHNICAL TERMS that name a specific
+engineering thing, copied exactly as written in the question.
+
+WHAT COUNTS AS A TECHNICAL ENTITY
+- System        : a complete engineered system or subsystem (e.g. "hydraulic braking system")
+- Component     : a physical or logical part (e.g. "pressure sensor", "ECU", "actuator")
+- ControlFactor : a design/control parameter that can be set or tuned (e.g. "gain", "sampling rate")
+- NoiseFactor   : an uncontrollable disturbance (e.g. "ambient temperature", "vibration")
+- ErrorState    : a failure mode, fault or defect (e.g. "sensor drift", "short circuit")
+- Method        : a technique, algorithm or analysis (e.g. "FMEA", "Taguchi method", "Kalman filter")
+- Procedure     : a defined process or test (e.g. "calibration procedure", "hazard analysis")
+- Standard      : a standard, regulation or document ID (e.g. "ISO 26262", "IEC 61508")
+- Concept       : a domain concept that is technical and specific (e.g. "robust design", "signal-to-noise ratio")
+
+RULES
+1. Copy the phrase EXACTLY as it appears in the question (same spelling, same case).
+2. Keep multi-word technical terms together as ONE entity. Return
+   "signal-to-noise ratio", not "signal", "noise", "ratio".
+3. Keep acronyms and identifiers as written (FMEA, ISO 26262, ECU, PID).
+4. Use the shortest phrase that still names the technical thing.
+   Drop leading articles and generic modifiers ("the", "a", "main", "different").
+5. Do NOT return any of these:
+   - question words (what, why, how, which, when, explain, describe)
+   - verbs, adjectives, adverbs
+   - generic words: process, system (alone), information, way, approach,
+     type, example, difference, purpose, role, importance, effect, use, step
+   - anything not written in the question. Never add synonyms or expansions.
+6. If a generic word is part of a specific term, keep the full term
+   ("calibration procedure" is valid, "procedure" alone is not).
+7. No duplicates. Order by importance to the question, most important first.
+8. Choose the single best class for each entity from the list above.
+   If unsure between two, use Concept.
+
+OUTPUT FORMAT
+One record per line, exactly:
+<entity phrase>|<class>
+No preamble, no markdown, no numbering, no explanation.
+If the question contains no technical entity, output exactly: NONE
+
+EXAMPLES
+Question: What is the role of FMEA in ensuring ISO 26262 compliance for the braking ECU?
+FMEA|Method
+ISO 26262|Standard
+braking ECU|Component
+
+Question: How does ambient temperature cause sensor drift in the pressure sensor?
+ambient temperature|NoiseFactor
+sensor drift|ErrorState
+pressure sensor|Component
+
+Question: Explain the difference between control factors and noise factors in Taguchi method.
+control factors|ControlFactor
+noise factors|NoiseFactor
+Taguchi method|Method
+
+Question: What is the best way to do this?
+NONE"""
+
+# Generic words that must never become a seed node on their own
+_GENERIC = {
+    "process", "system", "systems", "information", "way", "approach", "type",
+    "types", "example", "examples", "difference", "purpose", "role",
+    "importance", "effect", "use", "step", "steps", "thing", "things",
+    "what", "why", "how", "which", "when", "who", "explain", "describe",
+}
+
+_VALID_CLASSES = {
+    "System", "Component", "ControlFactor", "NoiseFactor", "ErrorState",
+    "Method", "Procedure", "Standard", "Concept",
+}
+
+_MAX_ENTITIES = 8
+
+
+def extract_query_entities(question: str):
+    """
+    Extract technical entity phrases from a user question via LLM.
+
+    Args:
+        question (str): The user's natural-language question.
+
+    Returns:
+        list[tuple[str, str]]: (phrase, class_hint) pairs, most important first.
+            phrase     : exact technical phrase found in the question
+            class_hint : System, Component, ControlFactor, NoiseFactor,
+                         ErrorState, Method, Procedure, Standard or Concept
+
+    Behaviour:
+        - Never raises. LLM failure degrades to [].
+        - "NONE" from the LLM returns [].
+        - Code-level filters remove generic words, duplicates, and any phrase
+          that does not actually appear in the question (hallucination guard).
+        - Cell 16 falls back to lexical matching when [] is returned.
+    """
+    try:
+        resp = driver_llm.invoke([
+            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "user", "content": f"Question: {question}"},
+        ])
+        text = resp.content.strip()
+    except Exception as e:
+        print(f"  entity extraction failed ({e}) -- lexical fallback")
+        return []
+
+    if text.upper().startswith("NONE"):
+        return []
+
+    q_lower = question.lower()
+    out, seen = [], set()
+
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*0123456789. ").strip()
+        if not line or "|" not in line:
+            continue
+
+        phrase, cls = line.split("|", 1)
+        phrase = phrase.strip().strip("\"'`")
+        cls = cls.strip()
+
+        if not phrase:
+            continue
+        key = phrase.lower()
+
+        # 1. drop generic single words
+        if key in _GENERIC:
+            continue
+        # 2. hallucination guard: phrase must occur in the question
+        if key not in q_lower:
+            continue
+        # 3. dedupe
+        if key in seen:
+            continue
+        # 4. normalise class
+        if cls not in _VALID_CLASSES:
+            cls = "Concept"
+
+        seen.add(key)
+        out.append((phrase, cls))
+
+        if len(out) >= _MAX_ENTITIES:
+            break
+
+    return out
+
+
+print("Defined: extract_query_entities(question)")
