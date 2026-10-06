@@ -1,0 +1,201 @@
+# ==============================================================================
+# CELL 31A - SETUP, HELPERS, KG INDEX, AND SCORING FUNCTIONS
+# ==============================================================================
+
+import re, math, json
+from collections import defaultdict, Counter
+from difflib import SequenceMatcher
+import numpy as np
+
+TOP_K = 10
+MAX_PER_DOC = 3
+CHUNK_SIZE = 900
+MIN_CHUNK = 120
+CHUNK_OVERLAP = 50 # chars to carry from the end of one chunk into the start of the next
+MMR_LAMBDA = 0.92  # raised from 0.82: less MMR diversity pressure, quality chunks dominate
+TOP_EDGES_PER_DOC = 5
+
+STOP = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "of", "to", "for", "from", "in", "on", "at", "by", "with", "and", "or",
+    "what", "which", "who", "where", "when", "why", "how",
+    "does", "do", "did", "should", "would", "could", "can", "may", "might"
+}
+MARKUP = re.compile(r"\[?<doc:(?:\w{8})\]?>|") 
+
+# ========== GENERIC WEIGHTS CONFIGURATION ==========
+GENERIC_WEIGHTS = (0.45, 0.35, 0.20) # Default (can update from grid-search or regression)
+
+def get_weights(query, seeds, query_tokens):
+    """
+    Optionally adapt weights depending on query/seeds;
+    Otherwise just return GENERIC_WEIGHTS.
+    """
+    n_seeds = len(seeds)
+    if n_seeds >= 3:
+        return (0.35, 0.45, 0.20)
+    elif n_seeds == 0:
+        return (0.8, 0.1, 0.1)
+    else:
+        return GENERIC_WEIGHTS
+
+# ========== HELPERS ==========
+def tokens(text):
+    return {
+        w for w in re.findall(r"[a-z0-9]+", str(text or "").lower())
+        if len(w) > 1 and w not in STOP
+    }
+
+def split_chunks(text):
+    text = re.sub(r"\s+", " ", MARKUP.sub(" ", str(text or ""))).strip()
+    if not text:
+        return []
+    sents = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", text)
+        if s.strip()
+    ]
+    chunks, buf = [], ""
+    for s in sents:
+        if len(s) > CHUNK_SIZE:
+            if len(buf) >= MIN_CHUNK:
+                chunks.append(buf)
+            buf = ""
+            for i in range(0, len(s), CHUNK_SIZE):
+                part = s[i:i + CHUNK_SIZE].strip()
+                if len(part) >= MIN_CHUNK:
+                    chunks.append(part)
+        elif len(buf) + len(s) + 1 <= CHUNK_SIZE:
+            buf = f"{buf} {s}".strip()
+        else:
+            if len(buf) >= MIN_CHUNK:
+                chunks.append(buf)
+            if CHUNK_OVERLAP and buf:
+                raw_tail = buf[-CHUNK_OVERLAP:]
+                space_idx = raw_tail.find(" ")
+                tail = raw_tail[space_idx + 1:].strip() if space_idx != -1 else raw_tail.strip()
+                buf = f"{tail} {s}".strip() if len(tail) + len(s) + 1 <= CHUNK_SIZE else s
+            else:
+                buf = s
+    if len(buf) >= MIN_CHUNK:
+        chunks.append(buf)
+    return chunks
+
+def jaccard(a, b):
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+if "fuzzy_match" not in globals():
+    def fuzzy_match(query, choices, limit=3, cutoff=72):
+        query = str(query or "").lower().strip()
+        scores = []
+        for choice in choices:
+            c = str(choice or "").lower().strip()
+            if not c: continue
+            score = SequenceMatcher(None, query, c).ratio() * 100
+            if score >= cutoff:
+                scores.append((choice, score))
+        return sorted(scores, key=lambda x: x[1], reverse=True)[:limit]
+
+# ========== BUILD KG CHUNK INDEX ==========
+DOC_Q = PREFIXES + """
+SELECT ?doc ?label ?ref ?content
+WHERE {
+    ?doc ex:documentContent ?content .
+    OPTIONAL { ?doc rdfs:label ?label }
+    OPTIONAL { ?doc ex:sourceReference ?ref }
+}
+"""
+
+KG_CHUNKS = defaultdict(list)
+KG_DF = Counter()
+KG_TOTAL = 0
+
+for r in g.query(DOC_Q):
+    uri = str(r.doc)
+    title = (
+        str(r.label)
+        if r.label
+        else NODE_LABEL.get(uri, uri)
+    )
+    reference = (
+        str(r.ref)
+        if r.ref
+        else uri
+    )
+    for idx, text in enumerate(split_chunks(str(r.content))):
+        ts = tokens(text)
+        if not ts: continue
+        chunk = {
+            "chunk_id": idx,
+            "content": text,
+            "title": title,
+            "reference": reference,
+            "doc_uri": uri,
+            "_tokens": ts
+        }
+        KG_CHUNKS[uri].append(chunk)
+        KG_DF.update(ts)
+        KG_TOTAL += 1
+
+# ========== SCORING FUNCTIONS ==========
+def idf(token):
+    return math.log(
+        (KG_TOTAL + 1) /
+        (KG_DF.get(token, 0) + 1)
+    ) + 1
+
+def coverage(important, chunk_tokens):
+    important = set(important)
+    if not important: return 0.0
+    total = sum(idf(t) for t in important) or 1.0
+    return (
+        sum(idf(t) for t in important if t in chunk_tokens) / total
+    )
+
+def local_graph_score(chunk_tokens, edge):
+    anchor = tokens(
+        f"{edge.get('source_label', '')} {edge.get('predicate', '')} {edge.get('target_label', '')}"
+    )
+    description = tokens(edge.get("description", ""))
+    return (
+        0.70 * coverage(anchor, chunk_tokens)
+        + 0.30 * coverage(description, chunk_tokens)
+    )
+
+def get_doc_scores(ranked_edges, seeds):
+    edges_by_doc = defaultdict(list)
+    seed_scores = {}
+    for e in ranked_edges:
+        for side in ("source", "target"):
+            uri = e[side]
+            if uri in KG_CHUNKS:
+                edges_by_doc[uri].append(e)
+    for uri, _, score, _ in seeds:
+        if uri in KG_CHUNKS:
+            seed_scores[uri] = max(
+                seed_scores.get(uri, 0),
+                score / 100
+            )
+    
+    docs = set(edges_by_doc) | set(seed_scores)
+    raw = {}
+    weights = [1.0, 0.5, 0.25, 0.125, 0.0625]
+    for uri in docs:
+        es = sorted(
+            edges_by_doc.get(uri, []),
+            key=lambda x: x.get("score", 0),
+            reverse=True
+        )[:TOP_EDGES_PER_DOC]
+        edges_by_doc[uri] = es
+        graph_score = sum(
+            e.get("score", 0) * w
+            for e, w in zip(es, weights)
+        )
+        raw[uri] = graph_score + seed_scores.get(uri, 0) * 20.0
+    max_score = max(raw.values(), default=1.0) or 1.0
+    normalized = {
+        uri: score / max_score
+        for uri, score in raw.items()
+    }
+    return normalized, edges_by_doc
