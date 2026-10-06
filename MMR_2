@@ -1,0 +1,230 @@
+# ==============================================================================
+# CELL 31B - MAIN RETRIEVER (MMR LOGIC) AND EXECUTION
+# ==============================================================================
+
+# ========== MAIN RETRIEVER ==========
+def top10_from_kg(query, debug=False):
+    # 1) Entity linking, seeds
+    phrases = extract_query_entities(query)
+    seeds = link_entities(phrases) if phrases else []
+
+    if phrases:
+        matched_phrases = {p for _, _, p in seeds}
+        for phrase, _, in phrases:
+            if phrase not in matched_phrases:
+                extra = content_search(phrase, limit=3)
+                if extra:
+                    seeds += extra
+                    if debug:
+                        print(f"  content fallback for '{phrase}': "
+                              f"{[l for _,l,_,_ in extra]}")
+    
+    if not seeds:
+        seeds = lexical_fallback(query, limit=8)
+    if not seeds:
+        print("No KG seed nodes found.")
+        return {"predictions": [{"data": []}]}
+
+    _entity_seed_uris = {n for n, _, s, _ in seeds if s >= 75 and n in KG_CHUNKS}
+    _content_seed_uris = {n for n, _, s, _ in seeds if 60 <= s < 75 and n in KG_CHUNKS}
+    def _cap(uri):
+        if uri in _entity_seed_uris: return 5
+        if uri in _content_seed_uris: return 2
+        return 1
+
+    edges, _ = traverse(seeds)
+    ranked_edges = rank_edges(edges) if edges else []
+    doc_scores, edges_by_doc = get_doc_scores(ranked_edges, seeds)
+    grounded_docs = set(doc_scores)
+    if not grounded_docs:
+        print("No KG-grounded documents found.")
+        return {"predictions": [{"data": []}]}
+    
+    # 3) Score all chunks
+    query_tokens = tokens(query)
+
+    # === GET WEIGHTS ===
+    W_QUERY, W_LOCAL_GRAPH, W_DOC_GRAPH = get_weights(query, seeds, query_tokens)
+    candidates = []
+    for uri in grounded_docs:
+        doc_score = doc_scores.get(uri, 0)
+        doc_edges = edges_by_doc.get(uri, [])
+        max_edge = max((e.get("score", 0) for e in doc_edges), default=0)
+        for c in KG_CHUNKS[uri]:
+            query_score = coverage(query_tokens, c["_tokens"])
+            graph_score = 0.0
+            for e in doc_edges:
+                importance = (e.get("score", 0) / max_edge) if max_edge > 0 else 0
+                score = local_graph_score(c["_tokens"], e) * importance
+                graph_score = max(graph_score, score)
+            if query_score <= 0 and graph_score <= 0:
+                continue
+            final_score = (
+                W_QUERY * query_score
+                + W_LOCAL_GRAPH * graph_score
+                + W_DOC_GRAPH * doc_score
+            )
+            candidates.append({
+                **c,
+                "_score": final_score,
+                "_query": query_score,
+                "_graph": graph_score,
+                "_doc": doc_score
+            })
+
+    if not candidates:
+        print("No relevant KG chunks found.")
+        return {"predictions": [{"data": []}]}
+    
+    # --- GLOBAL GREEDY MMR ---
+    # mmr() defined once outside the loop - Python would otherwise
+    # recreate the function object on every iteration (wasteful).
+    def mmr(c):
+        redundancy = max(
+            (jaccard(c["_tokens"], s["_tokens"]) for s in chosen), default=0
+        )
+        return MMR_LAMBDA * c["_score"] - (1 - MMR_LAMBDA) * redundancy
+
+    remaining = candidates.copy()
+    chosen = []
+    seen = set()
+    per_doc = defaultdict(int)
+    while len(chosen) < TOP_K and remaining:
+        eligible = [c for c in remaining if per_doc[c["doc_uri"]] < _cap(c["doc_uri"])]
+        if not eligible: break
+        best = max(eligible, key=mmr)
+        remaining.remove(best)
+        key = re.sub(r"\s+", " ", best["content"].lower()).strip()
+        if key in seen: continue
+        seen.add(key)
+        per_doc[best["doc_uri"]] += 1
+        chosen.append(best)
+        
+    # --- DOC LIMIT Fallback ---
+    if len(chosen) < TOP_K:
+        for c in sorted(candidates, key=lambda x: x["_score"], reverse=True):
+            if len(chosen) >= TOP_K: break
+            key = re.sub(r"\s+", " ", c["content"].lower()).strip()
+            if key in seen: continue
+            if per_doc[c["doc_uri"]] >= _cap(c["doc_uri"]): continue
+            seen.add(key)
+            per_doc[c["doc_uri"]] += 1
+            chosen.append(c)
+            
+    # --- Fallback for top10 ---
+    if len(chosen) < TOP_K:
+        for c in sorted(candidates, key=lambda x: x["_score"], reverse=True):
+            if len(chosen) >= TOP_K: break
+            key = re.sub(r"\s+", " ", c["content"].lower()).strip()
+            if key in seen: continue
+            seen.add(key)
+            chosen.append(c)
+
+    # --- Optional Debug ---
+    if debug:
+        print(f"\nQuery: {query}")
+        print(f"Entities: {[p for p, _, in phrases]}")
+        print(f"Seeds: {len(seeds)}")
+        print(f"Edges: {len(edges)}")
+        print(f"KG Docs: {len(grounded_docs)}")
+        print(f"Candidates: {len(candidates)}")
+        for i, c in enumerate(chosen[:TOP_K], 1):
+            print(
+                f"{i}. {c['title']} | final={c['_score']:.3f} | "
+                f"query={c['_query']:.3f} | graph={c['_graph']:.3f} | doc={c['_doc']:.3f}"
+            )
+
+    # --- resolve <EntityName> inline-hyperlink references ---
+    already_docs = {c["doc_uri"] for c in chosen}
+    linked_uris = {}
+    for c in chosen:
+        for m in re.finditer(r"<(?:[A-Za-z][^<>\n]{1,79})>", c["content"]):
+            name_lc = m.group(1).strip().lower()
+            for node in LABEL_TO_NODES.get(name_lc, []):
+                if node in KG_CHUNKS and node not in already_docs:
+                    linked_uris[node] = linked_uris.get(node, 0) + 1
+
+    inline_candidates = []
+    for uri in sorted(linked_uris, key=linked_uris.__getitem__, reverse=True)[:3]:
+        if uri in already_docs:
+            continue
+        best = max(KG_CHUNKS[uri],
+                   key=lambda ch: coverage(query_tokens, ch["_tokens"]))
+        inline_score = coverage(query_tokens, best["_tokens"])
+        inline_candidates.append({**best,
+                                  "_score": inline_score,
+                                  "_query": inline_score,
+                                  "_graph": 0.0, "_doc": 0.0})
+        already_docs.add(uri)
+        if debug:
+            print(f"  inline-link candidate: {best['title']} score={inline_score:.3f}")
+
+    if inline_candidates:
+        if len(chosen) >= TOP_K:
+            chosen.sort(key=lambda c: c.get("_score", 0.0))
+            for ic in sorted(inline_candidates,
+                             key=lambda c: c["_score"], reverse=True):
+                if ic["_score"] > chosen[0].get("_score", 0.0):
+                    chosen[0] = ic
+                    chosen.sort(key=lambda c: c.get("_score", 0.0))
+                    if debug:
+                        print(f"  replaced weak chunk with: {ic['title']}")
+        else:
+            chosen.extend(inline_candidates)
+
+    # --- Format as vector search output ---
+    return {
+        "predictions": [{
+            "data": [
+                {
+                    "content": c["content"],
+                    "title": c["title"],
+                    "reference": c["reference"]
+                }
+                for c in chosen
+            ]
+        }]
+    }
+
+# ==============================================================================
+# WRITE YOUR QUERY HERE
+# ==============================================================================
+try:
+    QUERY_KG = QUESTION 
+except NameError:
+    raise RuntimeError(
+        "QUESTION is not defined.\n"
+        "Run the Response cell (cell 32) first to set your query before running this cell."
+    ) from None
+
+# ==============================================================================
+# RUN KG TOP-10
+# ==============================================================================
+
+response_kg = top10_from_kg(
+    QUERY_KG,
+    debug=False
+)
+
+# ==============================================================================
+# PRINT OUTPUT
+# ==============================================================================
+
+print("\n" + "-" * 100)
+print("USER QUERY")
+print("-" * 100)
+print(QUERY_KG)
+
+print("\n" + "-" * 100)
+print("TOP 10 KG CHUNKS")
+print("-" * 100)
+
+print(
+    json.dumps(
+        response_kg,
+        indent=2,
+        ensure_ascii=False
+    )
+)
+
+print("\nStored in: response_kg")
